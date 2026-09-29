@@ -509,6 +509,20 @@ def grad_norm_summary(grad_norms):
             for ep, norms in enumerate(grad_norms) if norms]
 
 
+def wandb_run(a, out_dir):
+    """A Weights & Biases run for this training job when WANDB_API_KEY is set (project and entity from wandb's own
+    WANDB_PROJECT / WANDB_ENTITY; the `wandb` extra), named after the output directory; None otherwise, so runs without
+    the key are unchanged. A failure to start one only warns: under torchrun the other ranks would otherwise wait on
+    rank 0 until the collective timeout. A resumed run starts a new wandb run at its resume step."""
+    if not os.environ.get("WANDB_API_KEY"): return None
+    try:
+        import wandb
+        return wandb.init(name=out_dir.name, dir=str(out_dir), config=vars(a))
+    except Exception as e:
+        print(f"!!! wandb disabled: {type(e).__name__}: {e}", flush=True)
+        return None
+
+
 def pinned_revision(a, manifest):
     """The base commit this run trains against: the suite's pin, or --base_revision when the suite has none."""
     revision = manifest["base_revisions"].get(a.base) if manifest else None
@@ -569,6 +583,7 @@ def main():
     if not rank:
         write_json(out_dir / "training_config.json", {"args": vars(a), "suite_sha256": suite_hash, "base_revision": revision, "init_source": init_source,
                                                     "ordinal_objective": "ranked_probability_score", "holdout": holdout})
+    tracker = wandb_run(a, out_dir) if not rank else None
     print(f"{len(reqs)} training requests (holdout={holdout}), questions by type "
           f"{dict(Counter(q['qtype'] for r in reqs for q in materialize(r)['questions']))}")
 
@@ -635,9 +650,13 @@ def main():
                 sched.step(); opt.zero_grad(); step += 1
                 step_seconds.append(round(time.time() - last, 3)); last = time.time()
                 if dev == "mps": empty_cache(dev)   # MPS only: per-step cache release keeps the unified-memory footprint down; on CUDA it would just slow the step
+                logged = {"lr": sched.get_last_lr()[0], "grad_norm": grad_norms[ep][-1], "epoch": ep + (mb + 1) / len(plan)}
                 if step % 10 == 0:
                     print(f"ep{ep} step {step}/{steps} loss {run['ce']/run['n']:.3f} kl {run['kl']/max(run['kl_n'],1):.3f} anchor {run['anchor']/max(run['anchor_n'],1):.3f} {(time.time()-t0)/seen:.3f}s/rec", flush=True)
+                    logged |= {"loss": run["ce"] / run["n"], "kl": run["kl"] / max(run["kl_n"], 1), "anchor": run["anchor"] / max(run["anchor_n"], 1),
+                               "seconds_per_record": (time.time() - t0) / seen}
                     run = Counter()
+                if tracker: tracker.log(logged, step=step)
                 if step == steps: break
                 if snapshots and snapshots.due(step):
                     info = {"step": step, "steps": steps, "epoch": round(ep + (mb + 1) / len(plan), 6), "records_seen": round(full_ft.global_sum([seen])[0])}
@@ -654,6 +673,7 @@ def main():
     if writer: writer.wait()   # a resume point being written in the background is finished (and then superseded, or continued from)
     if snapshots: snapshots.wait()   # and the last snapshot
     if stopped:
+        if tracker: tracker.finish()
         print(f"stopped after step {step}; continue with --resume 1", flush=True); return
     seen, tokens_seen = full_ft.global_sum([seen, tokens_seen])   # ranks' micro-batches differ in size under --length_sort
 
@@ -665,13 +685,17 @@ def main():
     shutil.rmtree(resume_dir, ignore_errors=True)   # the checkpoint supersedes it
     meta.head, meta.extra = model.head.state_dict(), {"args": vars(a), "suite_sha256": suite_hash, "init_source": init_source}
     finish_checkpoint(a.out, meta, tok)
-    write_json(out_dir / "training_metrics.json", {"wall_seconds": wall, "records_seen": round(seen),
+    metrics = {"wall_seconds": wall, "records_seen": round(seen),
                "requested_records": a.epochs * len(reqs), "truncated_records": 0, "rejected_records": 0,
                "optimizer_steps": step, "forward_tokens": round(tokens_seen), "step_seconds": step_seconds, "optimizer_seconds": optimizer_seconds, "resume_seconds": resume_seconds, "resume_write_seconds": writer.seconds if writer else [], "world_size": world,
                "backbone_save_seconds": round(backbone_seconds, 1), "snapshots": snapshots.written if snapshots else [],   # snapshots: this attempt's (each snapshot.json has its own)
                "grad_norm": grad_norm_summary(grad_norms),
                "weights": meta.weights, "peak_device_bytes": peak_mem, "device": dev, "dtype": a.dtype, "batch": a.batch,
-               "peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (1 if sys.platform == "darwin" else 1024)})
+               "peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (1 if sys.platform == "darwin" else 1024)}
+    write_json(out_dir / "training_metrics.json", metrics)
+    if tracker:
+        tracker.summary.update({k: v for k, v in metrics.items() if isinstance(v, (int, float, str))})
+        tracker.finish()
     print("saved", a.out, flush=True)
 
 
