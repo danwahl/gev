@@ -99,7 +99,7 @@ def main():
         print(lang.value, "done", file=sys.stderr)
 
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
-    Path(a.out).write_text(json.dumps({"model": a.model, "revision": a.revision, "chat": chat, "items": items}, indent=1))
+    Path(a.out).write_text(json.dumps({"model": a.model, "revision": a.revision, "chat": chat, "items": items}, indent=1), encoding="utf-8")
 
 
 if __name__ == "__main__":

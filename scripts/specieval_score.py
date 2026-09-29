@@ -34,7 +34,7 @@ def answers(source):
     path = Path(source)
     if path.suffix == ".json":
         directions, lowest = [direction] if direction else ["forward", "reverse"], 1.0
-        for item in json.loads(path.read_text())["items"]:
+        for item in json.loads(path.read_text(encoding="utf-8"))["items"]:
             for d in directions:
                 if d in item:
                     lowest = min(lowest, item[d]["digit_mass"])
