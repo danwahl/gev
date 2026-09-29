@@ -458,3 +458,5 @@ runs/r25-27b-lr*e6/00-trial-0/checkpoint/*
 !runs/r25-27b-lr*e6/00-trial-0/snapshots/*/checkpoint/
 runs/r25-27b-lr*e6/00-trial-0/snapshots/*/checkpoint/*
 !runs/r25-27b-lr*e6/00-trial-0/snapshots/*/checkpoint/snapshot.json
+.env*
+.claude/GEV.md
