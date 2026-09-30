@@ -13,7 +13,7 @@ specieval=$1
 name=$2
 endpoint=${3:-http://127.0.0.1:8009/v1/systemone}
 reverse=$([ "${4:-}" = reverse ] && echo true || echo false)
-out=$(pwd)/runs/gev/specieval/$name$([ "$reverse" = true ] && echo -rev)
+out=$(pwd)/runs/gev/specieval/$name$([ "$reverse" = true ] && echo -rev || true)
 languages="en de fr es zh ja pl pt nl ru it id ko ms th"
 [ "$reverse" = true ] && languages=en
 
