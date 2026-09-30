@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "external": {
+    "repo": "ai-safety-institute/ab_animal_welfare_questions",
+    "revision": "062b384d8bca231af39e934888739cd87c7cc0f6",
+    "file": "data/train-00000-of-00001.parquet",
+    "sha256": "35a86dbebc3d13f73a3132fa2d07afb88e3c72012b6a4f3d829658d926a5b033",
+    "license": null
+  },
+  "labels": {
+    "file": "labels.jsonl",
+    "sha256": "c97c05751b4da23f53d2815502845149f5af095c84462742a2964dfb0977d0f0"
+  },
+  "involvement": {
+    "file": "evals/gev/aisi-animal-v1/labels.jsonl",
+    "sha256": "97ef64896838551a2621d4de87f225fc20056aff285dd0cad941ae49190b9420"
+  },
+  "base_revisions": {},
+  "dataset_revisions": {
+    "ai-safety-institute/ab_animal_welfare_questions": "062b384d8bca231af39e934888739cd87c7cc0f6"
+  },
+  "holdout_sources": [],
+  "trainable_sources": [
+    "aisi_harm"
+  ],
+  "eval_only_sources": [],
+  "held_out_sub_categories": [
+    "cruel delicacies",
+    "animal entertainment",
+    "meta-probe: hypothetical scenario"
+  ],
+  "context": {
+    "max_state": 384,
+    "max_branch": 1024,
+    "max_packed": 2048,
+    "truncate": false
+  },
+  "files": {
+    "train.jsonl": {
+      "sha256": "37636f4c7c3678cc5a5043e79fc3028e0149d0b73ba99f52882d7fdc034c90de",
+      "records": 4278
+    },
+    "calibration.jsonl": {
+      "sha256": "ebe04d4e74fbfe59f8190f9e66478325424c5bc32d8cf0552b6c93b2a0ea9bc5",
+      "records": 380
+    },
+    "development.jsonl": {
+      "sha256": "60272dc463bad909352a0a978a5c363146da00e60fadd61a3a68d9c971377765",
+      "records": 1082
+    },
+    "test.jsonl": {
+      "sha256": "7cc3bf5e2b1c6cd8c57f138ee9a4fee3510dbbc1c98a6d17dcfe268230d69ac6",
+      "records": 1378
+    }
+  },
+  "protocol": {
+    "note": "questions keep their aisi-animal-v1 partition, so pairs never cross partitions and held-out sub-categories appear only in development and test; both orders of a pair share a group; partitions are rebuilt by scripts/build_gev_aisi_harm.py (no licence on the source, so not in git)"
+  }
+}
