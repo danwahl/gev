@@ -460,3 +460,7 @@ runs/r25-27b-lr*e6/00-trial-0/snapshots/*/checkpoint/*
 !runs/r25-27b-lr*e6/00-trial-0/snapshots/*/checkpoint/snapshot.json
 .env*
 .claude/GEV.md
+
+# Gev: rebuilt by scripts/build_gev_aisi_animal.py (the source has no licence)
+evals/gev/aisi-animal-v1/*.jsonl
+!evals/gev/aisi-animal-v1/labels.jsonl
