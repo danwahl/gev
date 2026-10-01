@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Run the four SpeciEval tasks in every language against a System One endpoint (a local kev.serve by default).
+# Run the four SpeciEval tasks in every language (or those in SPECIEVAL_LANGUAGES) against a System One endpoint (a
+# local kev.serve by default).
 # Decision models are deterministic, so one epoch stands in for SpeciEval's ten.
 #
 #   scripts/specieval_decisions.sh <specieval checkout> <name> [endpoint] [reverse]
@@ -14,7 +15,7 @@ name=$2
 endpoint=${3:-http://127.0.0.1:8009/v1/systemone}
 reverse=$([ "${4:-}" = reverse ] && echo true || echo false)
 out=$(pwd)/runs/gev/specieval/$name$([ "$reverse" = true ] && echo -rev || true)
-languages="en de fr es zh ja pl pt nl ru it id ko ms th"
+languages=${SPECIEVAL_LANGUAGES:-"en de fr es zh ja pl pt nl ru it id ko ms th"}
 [ "$reverse" = true ] && languages=en
 
 cd "$specieval"

@@ -9,9 +9,12 @@ the controls, where both should be low; and the AUROC of P(wrong) between the be
 that mention animals (the 20 without animals left out as too easy). The controls are kind or neutral statements, not
 minimal pairs, so a model that judges harm in general also separates them; the AUROC says the model is not calling
 every animal statement wrong, and the benchmark's own P(wrong) says whether it condemns the speciesist ones.
-`--by-type` adds mean P(wrong) per use type (meat, fur, lab testing, ...).
+`--by-type` adds mean P(wrong) per use type (meat, fur, lab testing, ...). `--half climb|confirm` keeps one fixed half of
+the benchmark statements (by a hash of the id; controls stay whole), so a search can choose on one half and confirm on
+the other.
 """
 import argparse
+import hashlib
 from collections import defaultdict
 from pathlib import Path
 
@@ -29,6 +32,10 @@ def auroc(pos, neg):
     return float((pos > neg).mean() + 0.5 * (pos == neg).mean())
 
 
+def half(record_id):
+    return ("climb", "confirm")[hashlib.sha256(record_id.encode()).digest()[0] & 1]
+
+
 def read(run):
     types = {r["_meta"]["id"]: r["_meta"]["speciesism_type"] for r in load_split(SUITE, "development")}
     out = defaultdict(dict)  # id -> {question: P(positive answer)}
@@ -42,12 +49,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("runs", nargs="+", help="NAME=RESULT_DIR (a kev.benchmark --out directory)")
     ap.add_argument("--by-type", action="store_true")
+    ap.add_argument("--half", choices=["climb", "confirm"])
     a = ap.parse_args()
     print(f"{'run':18}{'P(spec)':>9}{'spec@':>7}{'P(wrong)':>10}{'wrong@':>8}{'ctl P(spec)':>13}{'ctl P(wrong)':>14}{'AUROC':>8}")
     by_type = {}
     for arg in a.runs:
         name, run = arg.split("=", 1)
-        recs = read(run)
+        recs = {i: r for i, r in read(run).items() if not a.half or r["source"] != BENCH or half(i) == a.half}
         b = [r for r in recs.values() if r["source"] == BENCH]
         c = [r for r in recs.values() if r["source"] == CONTROL]
         rate = lambda rs, q: np.mean([r[q] > 0.5 for r in rs])
