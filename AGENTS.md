@@ -54,7 +54,9 @@ Title Case sections, API tables, Authors + License); model cards are formal.
     split by question (27B on one H200 needs 8192; not with `--perm_kl` or `--anchor_w`). Needs torch >= 2.8. `--max_steps N` stops early. Resume: `--save_every_minutes M` /
     `--save_every_steps N` write `<out>/resume` (fp32 masters + moments per rank, scheduler, RNG, data position; under
     torchrun from a host copy in a background thread, the interval stretched so blocking stays under 5 %), `--resume 1`
-    continues bit for bit (same arguments and world size), `--stop_after N` exits after a step. Snapshots:
+    continues bit for bit (same arguments and world size), `--stop_after N` exits after a step. LoRA runs resume too (the
+    adapter and head are saved beside AdamW's moments); `--save_on_sigterm 1` writes a point after the current step on
+    SIGTERM and exits 143 (a preempted scheduler job), and `--resume 1` refuses a finished checkpoint. Snapshots:
     `--snapshot_fractions 0.25,0.5,0.75` (of the optimizer steps) / `--snapshot_every_steps N` write loadable bf16 checkpoints
     into `<snapshot_dir>/step-<N>/checkpoint` (N zero-padded to 7 digits like resume points, `step-0000389`; `--snapshot_dir`,
     default `<out>-snapshots`; `kev.full_ft.SnapshotWriter`; at most `kev.budget.MAX_SNAPSHOTS` = 8 per run, the disk they

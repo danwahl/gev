@@ -232,12 +232,13 @@ def save_due(step, every_steps, every_minutes, since, blocked):
 
 
 class ResumeWriter:
-    """Writes resume points: each rank's optimizer state (its shard's fp32 masters and moments), the lr scheduler and the
-    RNG states to `step-N/rank<r>.pt`, then rank 0's `latest.json` with the position (the data order, counters, the
-    arguments it must be resumed with), then removes earlier points. A 27B's state is ~307 GB and the runs volume writes it
-    at well under 1 GB/s, so where the state lives on the GPUs (FSDP2) `save` copies it to host memory and a thread
-    writes it while training goes on (the next `save`, and `wait`, join it first); where it already lives in host memory
-    (one GPU, offload) there is no room for a copy and `save` writes it before returning.
+    """Writes resume points: each rank's optimizer state (its shard's fp32 masters and moments; a LoRA run's AdamW moments
+    and, beside them, its trainable weights), the lr scheduler and the RNG states to `step-N/rank<r>.pt`, then rank 0's
+    `latest.json` with the position (the data order, counters, the arguments it must be resumed with), then removes
+    earlier points. A 27B's state is ~307 GB and the runs volume writes it at well under 1 GB/s, so where the state lives
+    on the GPUs (FSDP2) `save` copies it to host memory and a thread writes it while training goes on (the next `save`,
+    and `wait`, join it first); where it already lives in host memory (one GPU, offload) there is no room for a copy and
+    `save` writes it before returning.
     `after`: the SnapshotWriter; latest.json waits for a snapshot still being written (and is not written if it failed),
     so a resume point is never committed before the snapshots of the steps it has passed: a continuation from it could
     not write them again."""
@@ -247,7 +248,9 @@ class ResumeWriter:
         self.seconds = []   # how long each point took to write, in the background or not
         self.rank, self.world = (dist.get_rank(), dist.get_world_size()) if dist.is_initialized() else (0, 1)
 
-    def save(self, step, opt, sched, position, after=None):
+    def save(self, step, opt, sched, position, after=None, weights=None):
+        """`weights`: the trainable parameters, for an optimizer whose state does not hold them (a LoRA run's AdamW;
+        MasterAdamW's masters are the weights)."""
         self.wait()
         state = opt.state_dict()
         if self.background:   # host copies, allocated once and reused, so the optimizer may move on
@@ -259,6 +262,7 @@ class ResumeWriter:
             state = {"groups": state["groups"], "state": [{k: next(copies) for k in s} for s in state["state"]]}
         rng = {"torch": torch.get_rng_state(), "cuda": torch.cuda.get_rng_state() if torch.cuda.is_initialized() else None}
         payload = {"optimizer": state, "scheduler": copy.deepcopy(sched.state_dict()), "rng": rng}
+        if weights is not None: payload["weights"] = [p.detach().to("cpu", copy=True) for p in weights]
         if self.background:
             self.thread = threading.Thread(target=self._write, args=(step, payload, position, after), daemon=True); self.thread.start()
         else:
@@ -296,9 +300,10 @@ class ResumeWriter:
             if int(old.name.removeprefix("step-")) < step: shutil.rmtree(old)
 
 
-def load_resume(resume_dir, opt, sched, args):
+def load_resume(resume_dir, opt, sched, args, weights=None):
     """-> the saved position (or None when there is no resume point), after restoring this rank's optimizer state, the
-    weights, the scheduler and the RNG states. Refuses a point written with other arguments or another world size."""
+    weights (`weights`: the trainable parameters ResumeWriter.save was given), the scheduler and the RNG states. Refuses
+    a point written with other arguments or another world size."""
     resume_dir = Path(resume_dir)
     if not (resume_dir / LATEST).exists(): return None
     position = read_json(resume_dir / LATEST)
@@ -307,6 +312,11 @@ def load_resume(resume_dir, opt, sched, args):
         changed = sorted(k for k in set(args) | set(position["args"]) if args.get(k) != position["args"].get(k))
         raise ValueError(f"resume point {resume_dir} was written by {position['world']} rank(s) with other arguments: {changed or 'world size'}")
     saved = torch.load(resume_dir / position["dir"] / f"rank{rank}.pt", map_location="cpu", mmap=True, weights_only=True)
+    if weights is not None:
+        if len(saved["weights"]) != len(weights) or any(p.shape != w.shape for p, w in zip(weights, saved["weights"])):
+            raise ValueError("resume point does not match this model's trainable parameters")
+        with torch.no_grad():
+            for p, w in zip(weights, saved["weights"]): p.copy_(w)
     opt.load_state_dict(saved["optimizer"]); sched.load_state_dict(saved["scheduler"])
     torch.set_rng_state(saved["rng"]["torch"])
     if saved["rng"]["cuda"] is not None: torch.cuda.set_rng_state(saved["rng"]["cuda"])
