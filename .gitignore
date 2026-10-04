@@ -467,6 +467,7 @@ evals/gev/aisi-animal-v1/*.jsonl
 evals/gev/speciesismbench-v1/*.jsonl
 !evals/gev/speciesismbench-v1/controls.jsonl
 evals/gev/tac-v1/*.jsonl
+evals/gev/tac-v2/*.jsonl
 # Gev: rebuilt by scripts/build_gev_aisi_harm.py (the source has no licence)
 evals/gev/aisi-harm-v1/*.jsonl
 !evals/gev/aisi-harm-v1/labels.jsonl
