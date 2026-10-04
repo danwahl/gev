@@ -89,7 +89,7 @@ def test_source_sampling_does_not_depend_on_other_sources(monkeypatch):
 
 def test_strict_encoding_rejects_truncation():
     from types import SimpleNamespace
-    from kev.model import encode
+    from kev.model import SPECIAL, encode
 
     class Tokenizer:
         def __call__(self, text, **kwargs):
@@ -97,6 +97,9 @@ def test_strict_encoding_rejects_truncation():
 
         def convert_tokens_to_ids(self, text):
             return 1000
+
+        def get_vocab(self):
+            return dict.fromkeys(SPECIAL, 1000)
 
     rec = {"state": "abcdefgh", "questions": [{"instr": "q", "options": ["a", "b"], "label": 0}]}
     assert encode(Tokenizer(), rec, max_state=4)["state_truncated"]

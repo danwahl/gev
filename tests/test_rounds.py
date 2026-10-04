@@ -1070,12 +1070,13 @@ def test_calibrate_checkpoint_manual_temperature_needs_a_reason(tmp_path, monkey
 def test_state_lengths_count_the_encoded_state_segment(monkeypatch):
     """One definition of a state's token count: kev.model.encode's state segment, <state> token included (what serve reports)."""
     from kev.data import materialize
-    from kev.model import encode
+    from kev.model import SPECIAL, encode
     records = [{"state": "Refund window: 30 days. Order placed 12 days ago.", "questions": {"q": {"type": "noul", "instructions": "Refundable?", "label": True, "src": "x"}},
                 "_meta": {"id": "r/0"}}]
     class Tok:   # characters as tokens, plus the special tokens encode asks for
         def __call__(self, text, add_special_tokens=False): return type("E", (), {"input_ids": [ord(c) for c in text]})()
         def convert_tokens_to_ids(self, t): return 1
+        def get_vocab(self): return dict.fromkeys(SPECIAL, 1)
     monkeypatch.setattr(rounds, "load_split", lambda *a, **k: records)
     monkeypatch.setattr("kev.model.load_tokenizer", lambda *a: Tok())
     rounds.state_lengths.cache_clear()

@@ -9,6 +9,11 @@ from transformers.cache_utils import LinearAttentionCacheLayerMixin
 # Reuse existing rarely-used Qwen special tokens as delimiters (state, q, opt, /opt, decide) so no
 # embedding rows need to be added/trained; LoRA adapts their meaning.
 SPECIAL = ["<|fim_prefix|>", "<|fim_middle|>", "<|box_start|>", "<|box_end|>", "<|fim_suffix|>"]
+# The same five roles on other tokenizers, tried in order when a tokenizer lacks one of Qwen's. Each is an existing added token
+# whose embedding the base was trained with (no resize). Granite 4.x has the FIM tokens and <|filename|> / <|reponame|> (repo
+# metadata markers) but no <|box_*|>; its <|unused_N|> rows are not used because their embeddings were never trained, and
+# tied-embedding rows of that kind can coincide.
+DELIMITER_SETS = (SPECIAL, ["<|fim_prefix|>", "<|fim_middle|>", "<|filename|>", "<|reponame|>", "<|fim_suffix|>"])
 # training context: state tokens, tokens per question branch, and the whole packed record. Frozen suites are admitted with
 # this rule (kev.suite) and training applies it to records built on the fly, so train and eval see the same population.
 MAX_STATE, MAX_BRANCH, MAX_PACKED = 384, 1024, 2048
@@ -70,10 +75,46 @@ def is_hybrid(config):
 _SPECIAL_RE = re.compile(r"<\|([A-Za-z0-9_]+)\|>")
 
 
+def delimiters(tok):
+    """The five delimiter tokens (state, question, option, end of option, decide) of this tokenizer: the first of
+    DELIMITER_SETS present in its vocabulary (Qwen's whenever it has them, so Qwen encodings are unchanged). Derived from the
+    tokenizer, so a checkpoint load recovers it without head.pt; kept on the tokenizer, since get_vocab builds a dict of the
+    whole vocabulary and encode asks once per record."""
+    names = getattr(tok, "_kev_delimiters", None)
+    if names is None:
+        vocab = tok.get_vocab()
+        names = next((n for n in DELIMITER_SETS if all(t in vocab for t in n)), None)
+        if names is None: raise ValueError("tokenizer has none of the delimiter sets " + repr(DELIMITER_SETS))
+        tok._kev_delimiters = names
+    return names
+
+
+def _neutralised(m):
+    """`<|name|>` or `<name>` -> `<¦name¦>`: no longer an added token's text."""
+    return "<¦" + re.sub(r"^<\|?|\|?>$", "", m.group(0)) + "¦>"
+
+
+def _guard(tok):
+    """(pattern, replacement) user_tokens applies: `<|name|>` -> `<¦name¦>` for every tokenizer (all of Qwen's rewrite), plus,
+    when the delimiters are not Qwen's, the literal text of each added token (`<tool_call>`, `<|filename|>`), which would
+    otherwise tokenize to one id."""
+    g = getattr(tok, "_kev_guard", None)
+    if g is None:
+        if delimiters(tok) == SPECIAL:   # equality, not identity: a pickled tokenizer carries a copy
+            g = (_SPECIAL_RE, r"<¦\1¦>")
+        else:
+            # added tokens shaped <...> (Granite's are all <|...|> or <...>); another shape would stay forgeable
+            lits = sorted({t.content for t in tok.added_tokens_decoder.values() if len(t.content) > 2 and t.content[0] == "<" and t.content[-1] == ">"}, key=len, reverse=True)
+            g = (re.compile("|".join([re.escape(c) for c in lits] + [_SPECIAL_RE.pattern])), _neutralised)   # a named function: the tokenizer stays picklable
+        tok._kev_guard = g
+    return g
+
+
 def user_tokens(tok, text):
     """Tokenize caller-supplied text so it can never produce delimiter/control tokens (option boundaries are unforgeable).
     The fast tokenizer ignores split_special_tokens, so `<|name|>` is rewritten to `<¦name¦>` before tokenizing."""
-    return tok(_SPECIAL_RE.sub(r"<¦\1¦>", text), add_special_tokens=False).input_ids
+    pat, rep = _guard(tok)
+    return tok(pat.sub(rep, text), add_special_tokens=False).input_ids
 
 
 OPT_NONE, OPT_DECIDE = -1, -2   # values of enc["opt"]: instruction/state tokens, and the <decide> token
@@ -93,9 +134,10 @@ def encode(tok, rec, max_state=MAX_STATE, max_branch=MAX_BRANCH, strict=False, o
     state_tokens = user_tokens(tok, rec["state"])
     if strict and len(state_tokens) + 1 > max_state:
         raise ContextOverflow(f"state exceeds {max_state} tokens: {len(state_tokens) + 1}")
-    S = [tok.convert_tokens_to_ids(SPECIAL[0])] + state_tokens[: max_state - 1]
+    names = delimiters(tok)
+    S = [tok.convert_tokens_to_ids(names[0])] + state_tokens[: max_state - 1]
     ids, seg, pos, opt = list(S), [0] * len(S), list(range(len(S))), [OPT_NONE] * len(S)
-    q_id, o_id, c_id, d_id = (tok.convert_tokens_to_ids(t) for t in SPECIAL[1:])
+    q_id, o_id, c_id, d_id = (tok.convert_tokens_to_ids(t) for t in names[1:])
     decide_idx, opt_idx = [], []
     for k, q in enumerate(rec["questions"], start=1):
         instr = [q_id] + user_tokens(tok, q["instr"])
@@ -241,7 +283,7 @@ class DecisionModel(nn.Module):
         self.option_isolation = option_isolation
         if lora:
             from peft import LoraConfig, get_peft_model
-            extra = {"trainable_token_indices": {"embed_tokens": [tok.convert_tokens_to_ids(t) for t in SPECIAL]}} if special_embeddings else {}
+            extra = {"trainable_token_indices": {"embed_tokens": [tok.convert_tokens_to_ids(t) for t in delimiters(tok)]}} if special_embeddings else {}
             targets = {"all": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
                        "dense": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],   # "all" minus the DeltaNet projections on hybrids (retention ablation)
                        "attn": ["q_proj", "k_proj", "v_proj", "o_proj"], "qv": ["q_proj", "v_proj"]}[lora_targets]
