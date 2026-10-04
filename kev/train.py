@@ -10,7 +10,7 @@ whole backbone instead (kev.full_ft: bf16 weights, fp32 masters; several GPUs th
 Batch size is small (variable-length records with custom masks) and gradients are accumulated over --accum micro-batches
 (per rank: a step sees accum x batch x world size records).
 """
-import argparse, contextlib, dataclasses, json, math, os, random, resource, shutil, sys, time
+import argparse, contextlib, dataclasses, json, math, os, random, resource, shutil, signal, sys, threading, time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -427,10 +427,12 @@ def parse_args():
                                                                    "branch, none-pair siblings included) no forward/backward pass may exceed; the plan cuts on exact "
                                                                    "token shapes and gives a step more micro-batches (every rank the same count) until none does (0 = off)")
     ap.add_argument("--max_steps", type=int, default=0, help="stop after this many optimizer steps (0 = every epoch); the lr schedule spans them")
-    ap.add_argument("--save_every_steps", type=int, default=0, help="full-weight: write a resume point (<out>/resume) every N optimizer steps")
-    ap.add_argument("--save_every_minutes", type=float, default=0, help="full-weight: write a resume point once this many minutes have passed since the last")
-    ap.add_argument("--resume", type=int, choices=[0, 1], default=0, help="full-weight: continue from <out>/resume if it holds a resume point (same arguments), else start")
-    ap.add_argument("--stop_after", type=int, default=0, help="full-weight: exit after this optimizer step without saving the checkpoint (a run split across containers; tests)")
+    ap.add_argument("--save_every_steps", type=int, default=0, help="write a resume point (<out>/resume) every N optimizer steps")
+    ap.add_argument("--save_every_minutes", type=float, default=0, help="write a resume point once this many minutes have passed since the last")
+    ap.add_argument("--resume", type=int, choices=[0, 1], default=0, help="continue from <out>/resume if it holds a resume point (same arguments), else start")
+    ap.add_argument("--stop_after", type=int, default=0, help="exit after this optimizer step without saving the checkpoint (a run split across containers; tests)")
+    ap.add_argument("--save_on_sigterm", type=int, choices=[0, 1], default=0, help="on SIGTERM (a preempted or cancelled job), write a resume point after the "
+                                                                                 "current optimizer step and exit with status 143; rerun with --resume 1")
     ap.add_argument("--snapshot_fractions", default="", help="full-weight: also write a loadable checkpoint (the final one's files) after these fractions of the optimizer steps, "
                                                              "e.g. 0.25,0.5,0.75, into <snapshot_dir>/step-<N>/checkpoint; kept, never deleted ('' or none: no snapshots)")
     ap.add_argument("--snapshot_every_steps", type=int, default=0, help="full-weight: also write a snapshot every N optimizer steps")
@@ -469,8 +471,8 @@ def parse_args():
                  "nor --anchor_w (a split record's parts would weight its anchored questions by their part's share of all its questions, "
                  "not 1 / anchored questions), nor under torchrun (FSDP2 ranks must run the same number of backward passes; sharded "
                  "ranks have the memory without it)")
-    if (a.save_every_steps or a.save_every_minutes or a.resume or a.stop_after) and not a.full_ft:
-        ap.error("resume points are for full-weight runs (--full_ft 1)")
+    if a.resume and (Path(a.out) / "head.pt").exists():
+        ap.error(f"--resume 1: {a.out} is a finished checkpoint")
     try: fractions = full_ft.snapshot_fractions(a.snapshot_fractions)
     except ValueError as error: ap.error(str(error))
     if a.snapshot_every_steps < 0 or ((fractions or a.snapshot_every_steps) and not a.full_ft):
@@ -496,7 +498,8 @@ def finish_checkpoint(out, meta, tok):
     tok.save_pretrained(out)
 
 
-RESUME_KNOBS = ("resume", "save_every_steps", "save_every_minutes", "stop_after", "snapshot_fractions", "snapshot_every_steps", "snapshot_dir")   # may differ between a run and its continuation
+RESUME_KNOBS = ("resume", "save_every_steps", "save_every_minutes", "save_on_sigterm", "stop_after",   # may differ between a run and its continuation
+                "snapshot_fractions", "snapshot_every_steps", "snapshot_dir")
 RESUMED = ("step", "seen", "tokens_seen", "peak_mem", "optimizer_seconds", "step_seconds", "elapsed", "epoch", "microbatch", "grad_norms")   # counters a resume point carries
 
 
@@ -603,13 +606,16 @@ def main():
     step = seen = tokens_seen = peak_mem = optimizer_seconds = elapsed = start_epoch = start_mb = 0; step_seconds, resume_seconds = [], []; run = Counter()
     grad_norms = []   # per epoch, each optimizer step's global gradient norm before clipping
     resume_dir, resume_args = out_dir / "resume", {k: v for k, v in vars(a).items() if k not in RESUME_KNOBS}
-    position = full_ft.load_resume(resume_dir, opt, sched, resume_args) if a.resume else None
+    weights = None if a.full_ft else model.trainable_parameters()   # LoRA: AdamW's state does not hold the weights; MasterAdamW's masters are them
+    position = full_ft.load_resume(resume_dir, opt, sched, resume_args, weights) if a.resume else None
     if position:
         step, seen, tokens_seen, peak_mem, optimizer_seconds, step_seconds, elapsed, start_epoch, start_mb, grad_norms = (position[k] for k in RESUMED)
         seen, tokens_seen = seen / world, tokens_seen / world   # saved as sums over the ranks (global_sum below adds them back)
         run = Counter(position["run"])
         print(f"resumed from {resume_dir / position['dir']}: step {step}, epoch {start_epoch}, micro-batch {start_mb}", flush=True)
-    writer = full_ft.ResumeWriter(resume_dir, background=world > 1) if a.full_ft else None   # FSDP2: state on the GPUs, written from a host copy
+    writer = full_ft.ResumeWriter(resume_dir, background=world > 1)   # FSDP2: state on the GPUs, written from a host copy
+    terminated = threading.Event()
+    if a.save_on_sigterm: signal.signal(signal.SIGTERM, lambda *_: terminated.set())
     snapshots = None
     if a.full_ft and (plan_steps := full_ft.snapshot_steps(steps, full_ft.snapshot_fractions(a.snapshot_fractions), a.snapshot_every_steps)):
         snapshots = full_ft.SnapshotWriter(snapshot_root(a), plan_steps, background=world > 1)   # FSDP2: written from rank 0's gathered copy
@@ -664,17 +670,20 @@ def main():
                     snap_meta = dataclasses.replace(meta, head=head, extra={"args": vars(a), "suite_sha256": suite_hash, "init_source": init_source, "snapshot": info})
                     snapshots.save(step, model.lm, lambda d, m=snap_meta: finish_checkpoint(d, m, tok), info)
                     last = time.time()   # the time training blocked, not part of the next step's
-                if a.full_ft and full_ft.save_due(step, a.save_every_steps, a.save_every_minutes, saved_at, max(resume_seconds, default=0)):
+                sigterm = a.save_on_sigterm and full_ft.rank0_decides(terminated.is_set())
+                if sigterm or full_ft.save_due(step, a.save_every_steps, a.save_every_minutes, saved_at, max(resume_seconds, default=0)):
                     values = (step, *full_ft.global_sum([seen, tokens_seen]), peak_mem, optimizer_seconds, step_seconds, time.time() - t0, ep, mb + 1, grad_norms)
-                    writer.save(step, opt, sched, {**dict(zip(RESUMED, values)), "run": dict(run), "world": world, "args": resume_args}, after=snapshots)
+                    writer.save(step, opt, sched, {**dict(zip(RESUMED, values)), "run": dict(run), "world": world, "args": resume_args}, after=snapshots, weights=weights)
                     resume_seconds.append(round(time.time() - last, 3)); saved_at = last = time.time()   # the time training blocked, not part of the next step's
-                if step == a.stop_after: stopped = True; break
+                if step == a.stop_after or sigterm: stopped = True; break
         if step == steps or stopped: break
-    if writer: writer.wait()   # a resume point being written in the background is finished (and then superseded, or continued from)
+    writer.wait()   # a resume point being written in the background is finished (and then superseded, or continued from)
     if snapshots: snapshots.wait()   # and the last snapshot
     if stopped:
         if tracker: tracker.finish()
-        print(f"stopped after step {step}; continue with --resume 1", flush=True); return
+        print(f"stopped after step {step}; continue with --resume 1", flush=True)
+        if terminated.is_set(): sys.exit(128 + signal.SIGTERM)
+        return
     seen, tokens_seen = full_ft.global_sum([seen, tokens_seen])   # ranks' micro-batches differ in size under --length_sort
 
     wall = time.time() - t0
@@ -682,12 +691,12 @@ def main():
     else: model.lm.save_pretrained(a.out)
     if rank: return
     backbone_seconds = time.time() - t0 - wall
-    shutil.rmtree(resume_dir, ignore_errors=True)   # the checkpoint supersedes it
     meta.head, meta.extra = model.head.state_dict(), {"args": vars(a), "suite_sha256": suite_hash, "init_source": init_source}
     finish_checkpoint(a.out, meta, tok)
+    shutil.rmtree(resume_dir, ignore_errors=True)   # the checkpoint supersedes it (removed after head.pt: a kill between leaves one of them)
     metrics = {"wall_seconds": wall, "records_seen": round(seen),
                "requested_records": a.epochs * len(reqs), "truncated_records": 0, "rejected_records": 0,
-               "optimizer_steps": step, "forward_tokens": round(tokens_seen), "step_seconds": step_seconds, "optimizer_seconds": optimizer_seconds, "resume_seconds": resume_seconds, "resume_write_seconds": writer.seconds if writer else [], "world_size": world,
+               "optimizer_steps": step, "forward_tokens": round(tokens_seen), "step_seconds": step_seconds, "optimizer_seconds": optimizer_seconds, "resume_seconds": resume_seconds, "resume_write_seconds": writer.seconds, "world_size": world,
                "backbone_save_seconds": round(backbone_seconds, 1), "snapshots": snapshots.written if snapshots else [],   # snapshots: this attempt's (each snapshot.json has its own)
                "grad_norm": grad_norm_summary(grad_norms),
                "weights": meta.weights, "peak_device_bytes": peak_mem, "device": dev, "dtype": a.dtype, "batch": a.batch,

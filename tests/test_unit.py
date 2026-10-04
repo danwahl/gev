@@ -1066,6 +1066,52 @@ def test_resume_is_bit_identical(tiny_base, tmp_path, ranks, gate):
     assert norms[0] == norms[1] and [e["epoch"] for e in norms[0]] == [0, 1]   # carried across the resume point
 
 
+def _lora_state(out):
+    from safetensors.torch import load_file
+    from kev.checkpoint import read_meta
+    return load_file(out / "adapter_model.safetensors"), read_meta(out).head
+
+
+def _same(a, b):
+    return a.keys() == b.keys() and all(torch.equal(a[k], b[k]) for k in a)
+
+
+def test_lora_resume_is_bit_identical(tiny_base, tmp_path):
+    """A LoRA run's resume point carries the adapter and the head (AdamW's state does not hold them) besides the moments,
+    scheduler, RNG and data position: stopped after step 3 and continued with --resume 1, it ends with the same bits as an
+    uninterrupted run, across an epoch boundary. A finished checkpoint is not resumed (it would be trained over)."""
+    import subprocess, sys
+    args = ["--base", str(tiny_base / "base"), "--data", str(tiny_base / "data.jsonl"), "--device", "cpu", "--batch", "2", "--accum", "2",
+            "--lr", "1e-3", "--epochs", "2", "--p_none_pair", "0.5"]
+    _run_train(args, tmp_path / "whole")
+    _run_train([*args, "--save_every_steps", "3", "--stop_after", "3"], tmp_path / "split")
+    assert (tmp_path / "split/resume/latest.json").exists() and not (tmp_path / "split/head.pt").exists()
+    _run_train([*args, "--resume", "1"], tmp_path / "split")
+    (adapter_a, head_a), (adapter_b, head_b) = _lora_state(tmp_path / "whole"), _lora_state(tmp_path / "split")
+    assert _same(adapter_a, adapter_b) and _same(head_a, head_b) and not (tmp_path / "split/resume").exists()
+    done = subprocess.run([sys.executable, "-m", "kev.train", *args, "--resume", "1", "--out", str(tmp_path / "split")], capture_output=True, text=True)
+    assert done.returncode != 0 and "is a finished checkpoint" in done.stderr
+
+
+def test_sigterm_writes_a_resume_point(tiny_base, tmp_path):
+    """--save_on_sigterm 1: a SIGTERM (a preempted poppler job, a cancelled one) during training finishes the current
+    optimizer step, writes a resume point and exits 143; --resume 1 continues it to the same bits as an uninterrupted run."""
+    import signal, subprocess, sys
+    args = ["--base", str(tiny_base / "base"), "--data", str(tiny_base / "data.jsonl"), "--device", "cpu", "--batch", "2", "--accum", "2",
+            "--lr", "1e-3", "--epochs", "40"]
+    _run_train(args, tmp_path / "whole")
+    run = subprocess.Popen([sys.executable, "-u", "-m", "kev.train", *args, "--save_on_sigterm", "1", "--out", str(tmp_path / "split")],
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    for line in run.stdout:
+        if " step 10/" in line: run.send_signal(signal.SIGTERM); break
+    out = line + run.stdout.read()
+    assert run.wait() == 128 + signal.SIGTERM and "continue with --resume 1" in out, out[-2000:]
+    assert (tmp_path / "split/resume/latest.json").exists() and not (tmp_path / "split/head.pt").exists()
+    _run_train([*args, "--resume", "1"], tmp_path / "split")
+    (adapter_a, head_a), (adapter_b, head_b) = _lora_state(tmp_path / "whole"), _lora_state(tmp_path / "split")
+    assert _same(adapter_a, adapter_b) and _same(head_a, head_b)
+
+
 def test_fsdp2_ranks_train_what_one_process_trains(tiny_base, tmp_path):
     """Two gloo ranks under torchrun (FSDP2 over the layers, the head replicated) take the same first step as one process
     with the same records per step: the sharded gradient is the sum over ranks, not the mean."""
