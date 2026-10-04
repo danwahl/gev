@@ -514,13 +514,13 @@ def grad_norm_summary(grad_norms):
 
 def wandb_run(a, out_dir):
     """A Weights & Biases run for this training job when WANDB_API_KEY is set (project and entity from wandb's own
-    WANDB_PROJECT / WANDB_ENTITY; the `wandb` extra), named after the output directory; None otherwise, so runs without
+    WANDB_PROJECT / WANDB_ENTITY; the `wandb` extra), named WANDB_NAME or else after the output directory; None otherwise, so runs without
     the key are unchanged. A failure to start one only warns: under torchrun the other ranks would otherwise wait on
     rank 0 until the collective timeout. A resumed run starts a new wandb run at its resume step."""
     if not os.environ.get("WANDB_API_KEY"): return None
     try:
         import wandb
-        return wandb.init(name=out_dir.name, dir=str(out_dir), config=vars(a))
+        return wandb.init(name=os.environ.get("WANDB_NAME") or out_dir.name, dir=str(out_dir), config=vars(a))
     except Exception as e:
         print(f"!!! wandb disabled: {type(e).__name__}: {e}", flush=True)
         return None
