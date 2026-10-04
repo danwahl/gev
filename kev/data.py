@@ -22,7 +22,7 @@ def source_seed(seed, source):
 
 
 # Repos whose main branch is a (no longer supported) loading script; read the Hub's auto-converted parquet branch instead.
-PARQUET_BRANCH = {"CogComp/trec": "refs/convert/parquet"}
+PARQUET_BRANCH = {"CogComp/trec": "refs/convert/parquet", "hendrycks/ethics": "refs/convert/parquet"}
 
 
 def dataset_ref(repo):
@@ -40,10 +40,10 @@ class Source(random.Random):
         self.origins = []
 
 
-def _dataset(repo, split, src):
+def _dataset(repo, split, src, data_dir=None):
     """repo may be 'owner/name' or 'owner/name:config'; the Source carries the revision to pin."""
     name, _, config = repo.partition(":")
-    return load_dataset(name, config or None, split=split, revision=src.revision or PARQUET_BRANCH.get(name))
+    return load_dataset(name, config or None, split=split, revision=src.revision or PARQUET_BRANCH.get(name), data_dir=data_dir)
 
 NONE = "None of the above"
 # "None of the above" options must appear both as the correct answer and as a wrong alternative, with varied
@@ -59,6 +59,8 @@ AG = {"world": "World news: politics, international affairs, conflicts", "sports
       "business": "Business: companies, markets, economy, finance", "scitech": "Science and technology: research, gadgets, software, space"}
 MNLI = {"entailment": "The hypothesis follows from the premise", "neutral": "The hypothesis may or may not be true given the premise", "contradiction": "The hypothesis contradicts the premise"}
 SST5 = ["very negative", "negative", "neutral", "positive", "very positive"]
+# Social Chemistry 101 (Forbes et al. 2020): the crowd's moral judgement of an action, its five levels in the paper's words.
+SOCIAL_CHEM = ["very bad", "bad", "expected or OK", "good", "very good"]
 YELP = ["1 star: terrible experience", "2 stars: poor", "3 stars: average", "4 stars: good", "5 stars: excellent"]
 BANK_TEMPLATES = ["Customer asks about {}", "Issue concerning {}", "Request related to {}", "{}"]
 
@@ -89,7 +91,7 @@ def _sample(ds, n, src):
         row = ds[i]
         if row.get("label", 0) == -1:
             continue
-        text = next((row[k] for k in ("text", "premise", "passage", "content", "question", "sentence") if isinstance(row.get(k), str)), json.dumps(row, sort_keys=True))
+        text = next((row[k] for k in ("text", "premise", "passage", "content", "question", "sentence", "input", "scenario", "action") if isinstance(row.get(k), str)), json.dumps(row, sort_keys=True))
         normalized = " ".join(text.casefold().split())
         src.origins.append({"row": i, "text_sha256": hashlib.sha256(normalized.encode()).hexdigest(),
                             "row_sha256": hashlib.sha256(json.dumps(row, sort_keys=True).encode()).hexdigest()})
@@ -270,15 +272,55 @@ def _csqa(split, n, rng):
     return [_mcq(ex["question"], list(ex["choices"]["label"]), list(ex["choices"]["text"]), ex["answerKey"], "csqa", rng) for ex in _sample(ds, n, rng) if ex["answerKey"]]
 
 
+def _ethics(split, n, rng):
+    """ETHICS (Hendrycks et al. 2021): each of its five subsets with its own task and label, n // 5 records each."""
+    out, origins = [], []
+    for subset in ("commonsense", "justice", "deontology", "virtue", "utilitarianism"):
+        ds = _dataset("hendrycks/ethics", split=split, src=rng, data_dir=subset)
+        for ex in _sample(ds, n // 5, rng):
+            if subset == "commonsense":
+                q = {"instructions": "Is the narrator's action clearly morally wrong?", "label": ex["label"] == 1, "src": "ethics_cm"}
+                state = " ".join(ex["input"].split()[:220])
+            elif subset == "justice":
+                q = {"instructions": "Is this a reasonable claim?", "label": ex["label"] == 1, "src": "ethics_justice"}
+                state = ex["scenario"]
+            elif subset == "deontology":
+                q = {"instructions": f'Excuse: "{ex["excuse"].strip()}" Is this a reasonable excuse?', "label": ex["label"] == 1, "src": "ethics_deontology"}
+                state = ex["scenario"]
+            elif subset == "virtue":
+                state, trait = ex["scenario"].split(" [SEP] ")
+                q = {"instructions": f'Does this scenario exemplify the trait "{trait}"?', "label": ex["label"] == 1, "src": "ethics_virtue"}
+            else:
+                out.append(_mcq("Which scenario is more pleasant for the person?", ["baseline", "less_pleasant"], [ex["baseline"], ex["less_pleasant"]], "baseline", "ethics_util", rng))
+                continue
+            out.append({"state": _wrap_state(state, rng), "questions": {"answer": {"type": "noul", **q, "instructions": _instr(q["instructions"], rng)}}})
+        origins += [{**o, "row": f"{subset}/{o['row']}"} for o in rng.origins]
+    rng.origins = origins
+    return out
+
+
+def _social_chem(split, n, rng):
+    """Social Chemistry 101: an action (from a rule of thumb) and the crowd's judgement of it, -2..2, as a five-level Score.
+    The dataset is one table with its own split column; rows whose rule of thumb annotators flagged as bad are dropped."""
+    ds = _dataset("tasksource/social-chemestry-101", split="train", src=rng)
+    ds = ds.filter(lambda r: r["split"] == split and r["action-moral-judgment"] is not None and not r["rot-bad"])
+    return [{"state": _wrap_state(ex["action"], rng),
+             "questions": {"judgement": {"type": "score", "instructions": _instr("How good or bad is this action?", rng),
+                                         "criteria": list(SOCIAL_CHEM), "label": int(ex["action-moral-judgment"]) + 2,
+                                         "src": "social_chem"}}} for ex in _sample(ds, n, rng)]
+
+
 ALL_SOURCES = {**SOURCES, "trec": (_trec, "train", "test"), "dbpedia14": (_dbpedia, "train", "test"), "emotion": (_emotion, "train", "test"),
                "imdb": (_imdb, "train", "test"), "amazon": (_amazon, "train", "test"), "qnli": (_qnli, "train", "validation"),
                "tweet_offensive": (_offensive, "train", "test"), "mmlu": (_mmlu, "test", "test"),
                "paws": (_paws, "train", "test"), "sciq": (_sciq, "train", "test"),
-               "arc": (_arc, "train", "test"), "openbookqa": (_openbookqa, "train", "test"), "csqa": (_csqa, "train", "validation")}
+               "arc": (_arc, "train", "test"), "openbookqa": (_openbookqa, "train", "test"), "csqa": (_csqa, "train", "validation"),
+               "ethics": (_ethics, "train", "test"), "social_chem": (_social_chem, "train", "test")}
 ALL_REPOS = {**REPOS, "trec": "CogComp/trec", "dbpedia14": "fancyzhx/dbpedia_14", "emotion": "dair-ai/emotion", "imdb": "stanfordnlp/imdb",
              "amazon": "SetFit/amazon_reviews_multi_en", "qnli": "nyu-mll/glue", "tweet_offensive": "cardiffnlp/tweet_eval", "mmlu": "cais/mmlu",
              "paws": "google-research-datasets/paws", "sciq": "allenai/sciq",
-             "arc": "allenai/ai2_arc", "openbookqa": "allenai/openbookqa", "csqa": "tau/commonsense_qa"}
+             "arc": "allenai/ai2_arc", "openbookqa": "allenai/openbookqa", "csqa": "tau/commonsense_qa", "ethics": "hendrycks/ethics",
+             "social_chem": "tasksource/social-chemestry-101"}
 
 # Policy (PLAN.md step 1). A source is trainable or eval-only; suites record both lists and training refuses eval-only
 # sources. MMLU is a knowledge probe and stays eval-only permanently; Emotion/TweetEval are noisy-label honesty checks;
@@ -286,7 +328,10 @@ ALL_REPOS = {**REPOS, "trec": "CogComp/trec", "dbpedia14": "fancyzhx/dbpedia_14"
 # Knowledge MCQ (ARC-Challenge, OpenBookQA, CommonsenseQA) is trainable: the hypothesis (PLAN.md, overnight) is that the
 # pointer readout under-uses the base model's knowledge (8B scores 0.65 on 4-way MMLU, below its base-model level) and
 # that a small MCQ mix teaches the head to tap it. MMLU and SciQ stay eval-only; ARC/SciQ are distinct datasets.
-TRAINABLE = ("banking77", "boolq", "agnews", "mnli", "sst5", "yelp", "trec", "dbpedia14", "amazon", "imdb", "arc", "openbookqa", "csqa")
+# ETHICS (Hendrycks et al. 2021) is trainable: five moral-judgement tasks, each in its own native form; its test split is the eval split.
+# Social Chemistry 101 (CC BY-SA 4.0) is trainable: graded crowd judgements of everyday actions.
+TRAINABLE = ("banking77", "boolq", "agnews", "mnli", "sst5", "yelp", "trec", "dbpedia14", "amazon", "imdb", "arc", "openbookqa", "csqa", "ethics",
+             "social_chem")
 EVAL_ONLY = ("mmlu", "emotion", "tweet_offensive", "qnli", "paws", "sciq")
 assert set(TRAINABLE) | set(EVAL_ONLY) == set(ALL_SOURCES) and not set(TRAINABLE) & set(EVAL_ONLY)
 
