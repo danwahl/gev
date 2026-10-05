@@ -6,6 +6,9 @@ forms over the same items, for an A:B of question form:
     uv run python scripts/build_gev_ethics.py --arm ethics-animals-likert  [--n 200]   # runs/gev/hc/data/ethics-animals-likert.jsonl
     uv run python scripts/build_gev_ethics.py --arm ethics-animals                     # runs/gev/hc/data/ethics-animals.jsonl
 
+--out writes elsewhere; a yes/no arm then reads the -likert file beside it (`--out x.jsonl` reads x-likert.jsonl), so name a
+-likert arm's --out with that suffix. --pairs sets the -likert arms' utilitarianism pairs (default n/2).
+
 ethics-likert: each item as a statement, once as worded and once negated (two records of one group), as a SpeciEval-style 7-point
 agreement question under INSTR_ETHICS ("statement about ethics"):
   commonsense (is_short)        "This is (not) wrong: <input>"
@@ -18,7 +21,7 @@ Deontology roles are told from requests by their first word (ROLE). The statemen
 from the teacher (scripts/gev_teacher_likert.py, then runs/gev/hc/ethics-likert-train.sh). `_meta.label` is ETHICS's own 1/0
 for the item (utilitarianism has none: `_meta.pair` and `more_pleasant` instead) and `_meta.direction` fwd/neg, for teacher
 checks. Items matching STRICT (animals) are excluded, and so are items over MAX_CHARS. --n items per subset (commonsense,
-justice, deontology: half of each label; virtue: n/2 sentences; utilitarianism: n/2 pairs).
+justice, deontology: half of each label; virtue: n/2 sentences; utilitarianism: --pairs pairs).
 
 ethics-animals-likert: the same, from the items that DO match STRICT (a utilitarianism pair when either activity does; virtue takes
 every sentence there is, up to n/2).
@@ -81,7 +84,7 @@ def record(source, rid, group, state, **meta):
     return rec
 
 
-def ethics_likert(n, animals=False):
+def ethics_likert(n, animals=False, pairs=None):
     source = "ethics_likert"
     rng = random.Random(f"ethics_paper_likert:{SEED}")   # the source's first name, so the file trained on rebuilds exactly
     skipped, items = Counter(), {}
@@ -139,7 +142,7 @@ def ethics_likert(n, animals=False):
     util = {}
     for g in items["utilitarianism"][None]: util.setdefault(g[0]["_meta"]["pair"], []).append(g)
     whole = sorted(p for p, gs in util.items() if len(gs) == 2)
-    out += [r for p in rng.sample(whole, min(n // 2, len(whole))) for g in sorted(util[p], key=lambda g: g[0]["_meta"]["id"]) for r in g]
+    out += [r for p in rng.sample(whole, min(n // 2 if pairs is None else pairs, len(whole))) for g in sorted(util[p], key=lambda g: g[0]["_meta"]["id"]) for r in g]
     print(f"skipped {dict(sorted(skipped.items()))}")
     return out
 
@@ -194,19 +197,21 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arm", choices=["ethics-likert", "ethics", "ethics-animals-likert", "ethics-animals"], required=True)
     ap.add_argument("--n", type=int, default=200, help="items per subset (the -likert arms)")
+    ap.add_argument("--pairs", type=int, help="utilitarianism pairs (the -likert arms only; default n/2)")
+    ap.add_argument("--out", help="default runs/gev/hc/data/ARM.jsonl; a yes/no arm reads OUT-STEM-likert.jsonl beside it")
     a = ap.parse_args()
     animals = "animals" in a.arm
-    out = Path(f"runs/gev/hc/data/{a.arm}.jsonl")
+    out = Path(a.out or f"runs/gev/hc/data/{a.arm}.jsonl")
     # the order seeds keep the arms' first names (ethics-paper, ethics-paper-native, ...) so the files trained on rebuild exactly
     seed = f"order:ethics-paper{'-animals' * animals}{'' if a.arm.endswith('likert') else '-native'}:{SEED}"
     if a.arm.endswith("likert"):
-        recs = ethics_likert(a.n, animals=animals)
+        recs = ethics_likert(a.n, animals=animals, pairs=a.pairs)
         groups = [recs[i:i + 2] for i in range(0, len(recs), 2)]
         random.Random(seed).shuffle(groups)
         recs = [r for g in groups for r in g]
         c = Counter((r["_meta"]["subset"], r["_meta"].get("label")) for r in recs if r["_meta"]["direction"] == "fwd")
     else:
-        recs = ethics_native(out.with_name(f"{a.arm}-likert.jsonl"))
+        recs = ethics_native(out.with_name(f"{out.stem}-likert.jsonl"))
         groups = {}
         for r in recs: groups.setdefault(r["_meta"]["group_id"], []).append(r)
         groups = list(groups.values())
