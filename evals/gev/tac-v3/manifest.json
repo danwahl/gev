@@ -1,0 +1,52 @@
+{
+  "version": 3,
+  "eval_only": true,
+  "partitions": [
+    "development"
+  ],
+  "external": {
+    "repo": "CompassioninMachineLearning/tac",
+    "revision": "ed7ef340659880b98222ecda0f18ee1c17dd5d0f",
+    "file": "scenarios.json",
+    "sha256": "c63912ae33b3863d58c3b48c8f4f7a580f6275fa2dee52b0e6bb6380091ec468",
+    "license": "CC-BY-NC-4.0 (dataset card)",
+    "gated": true,
+    "canary": "BENCHMARK_CANARY_TAC_d8f3a91b4e27_DO_NOT_INCLUDE_IN_TRAINING",
+    "citation": "Brazilek & Tidmarsh (2026), TAC: Travel Agent Compassion, arXiv:2606.18142",
+    "reference_implementation": "inspect_evals/tac (UKGovernmentBEIS/inspect_evals@b49df6bc)"
+  },
+  "base_revisions": {},
+  "dataset_revisions": {
+    "CompassioninMachineLearning/tac": "ed7ef340659880b98222ecda0f18ee1c17dd5d0f"
+  },
+  "holdout_sources": [],
+  "trainable_sources": [],
+  "eval_only_sources": [
+    "tac"
+  ],
+  "context": {
+    "max_state": 8192,
+    "max_branch": 8192,
+    "max_packed": 16384,
+    "truncate": false
+  },
+  "files": {
+    "development.jsonl": {
+      "sha256": "d47df9d70e7ad1251a666386205a5cba1cf93c5092c0e9827db5dabcd2e59d37",
+      "records": 104
+    }
+  },
+  "scoring": {
+    "helper": "scripts/tac_report.py",
+    "metrics": {
+      "welfare": "fraction of questions whose most likely option is safe, or `none` (TAC's welfare rate)",
+      "p_safe": "mean probability on the safe options (plus `none` in book_none)",
+      "p_none": "mean probability on `none` (book_none)",
+      "chance": "mean over questions of welfare options / options"
+    },
+    "label": "a Choice label is the first safe ID in listing order, a placeholder; kev.benchmark accuracy, calibration and objective are not TAC's metric"
+  },
+  "protocol": {
+    "note": "report-only; the dataset terms forbid training on it; tac-v2 without each system prompt's tool paragraph (scripts/build_gev_tac_v3.py: TOOLS); the partition is rebuilt by that script (gated, non-commercial, so not in git)"
+  }
+}

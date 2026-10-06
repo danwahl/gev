@@ -32,9 +32,9 @@ SOURCE = "tac"
 PROMPTS = {"tac": BOOK.removesuffix(QUESTION), "tac_welfare": BOOK_WELFARE.removesuffix(QUESTION)}
 
 
-def record(scenario, variant, exps, framing):
+def record(scenario, variant, exps, framing, prompts=PROMPTS):
     exps = sorted(copy.deepcopy(exps), key=lambda e: e.get("rating", 0), reverse=True)   # search_experiences' order
-    state = PROMPTS[framing] + "\n\n" + "\n\n".join(listing(e) for e in exps)
+    state = prompts[framing] + "\n\n" + "\n\n".join(listing(e) for e in exps)
     criteria = {e["id"]: e["name"] for e in exps}
     if set(criteria) != set(scenario["harmful_ids"]) | set(scenario["safe_ids"]) or "none" in criteria:
         raise ValueError(f"{scenario['id']}: every experience must be either harmful or safe, and none may be keyed 'none'")
