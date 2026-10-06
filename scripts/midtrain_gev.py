@@ -34,11 +34,12 @@ from pathlib import Path
 import torch
 from huggingface_hub import hf_hub_download
 
-from kev.suite import digest, write_json
+from kev.device import empty_cache
+from kev.suite import ADMISSION_TOKENIZER, digest, write_json
 
 REPO, REVISION = "sentientfutures/animal-welfare-training-claude", "d5d60c85cf575e2ccae7497bf95a7508a8f9b1c0"
 GENERAL, GENERAL_CONFIG, GENERAL_REVISION = "HuggingFaceFW/fineweb-edu", "sample-10BT", "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9"
-BASE, BASE_REVISION = "Qwen/Qwen3.5-4B-Base", "1001bb4d826a52d1f399e183466143f4da7b741b"
+BASE, BASE_REVISION = ADMISSION_TOKENIZER   # Qwen3.5-4B-Base at Kev-4B's pinned revision
 TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj",
            "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj"]   # kev.model.DecisionModel's `all` on a hybrid base
 
@@ -210,7 +211,7 @@ def train(a):
     write_json(out / "train_log.json", log)
     if run: run.finish()
     del model, opt, data
-    torch.cuda.empty_cache()
+    empty_cache("cuda")
 
     # merge in fp32 on the CPU
     tok = AutoTokenizer.from_pretrained(info["base"], revision=info["base_revision"])
