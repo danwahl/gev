@@ -173,6 +173,8 @@ def main():
     ap.add_argument("--run", help="checkpoint dir or Hub id (local scoring)")
     ap.add_argument("--remote", help="base URL of a System One-compatible endpoint to score instead of a local checkpoint")
     ap.add_argument("--remote-model", default="kev-latest")
+    ap.add_argument("--remote-path", default="/v1/systemone", help="the endpoint's path under --remote (OpenRouter's Decisions API: --remote https://openrouter.ai --remote-path /api/alpha/decisions)")
+    ap.add_argument("--remote-retries", type=int, default=3, help="attempts per request against --remote, with 1, 2, 4, ... s backoff (raise it for a rate-limited endpoint)")
     ap.add_argument("--remote-concurrency", type=int, default=1, help="requests kept in flight against --remote (1 = sequential); rows and their order do not depend on it")
     ap.add_argument("--suite", help="frozen suite directory (scores its development partition)")
     ap.add_argument("--data", help="your own labelled requests, one JSON object per line (kev.data.load_records); an alternative to --suite")
@@ -187,6 +189,7 @@ def main():
     if bool(a.run) == bool(a.remote): ap.error("give exactly one of --run or --remote")
     if a.rotations < 1: ap.error("--rotations must be >= 1")
     if a.remote_concurrency < 1: ap.error("--remote-concurrency must be >= 1")
+    if a.remote_retries < 1: ap.error("--remote-retries must be >= 1")
     if bool(a.suite) == bool(a.data): ap.error("give exactly one of --suite or --data")
     if a.data:
         records, heldout, split, source_hash = load_records(a.data), [], "custom", digest(Path(a.data))
@@ -199,12 +202,12 @@ def main():
         context, skip_overlong = manifest.get("context", CONTEXT), bool(manifest.get("eval_only"))
     if a.date_facts:
         records = [{**r, "state": with_date_facts(r["state"])} for r in records]
-    predictor = RemotePredictor(a.remote, a.remote_model, os.environ.get("KEV_REMOTE_API_KEY", "local"), concurrency=a.remote_concurrency) if a.remote else LocalPredictor(a.run, a.device, LoadOptions.from_env(), context=context)
+    predictor = RemotePredictor(a.remote, a.remote_model, os.environ.get("KEV_REMOTE_API_KEY", "local"), retries=a.remote_retries, concurrency=a.remote_concurrency, path=a.remote_path) if a.remote else LocalPredictor(a.run, a.device, LoadOptions.from_env(), context=context)
     scorer = RotationAveraged(predictor, a.rotations) if a.rotations > 1 else predictor
     report, _ = evaluate_records(records, scorer, a.out, heldout_sources=tuple(heldout), skip_overlong=skip_overlong)
     report.update(suite_sha256=source_hash, data=a.data, date_facts=a.date_facts, rotations=a.rotations, run=a.run or a.remote, split=split,
                   calibration_applied=predictor.temperature != 1.0 if not a.remote else None,
-                  remote={"base_url": a.remote, "requested_model": a.remote_model, "served_model": predictor.served_model, "concurrency": a.remote_concurrency} if a.remote else None)
+                  remote={"base_url": a.remote, "path": a.remote_path, "requested_model": a.remote_model, "served_model": predictor.served_model, "concurrency": a.remote_concurrency, "retries": a.remote_retries} if a.remote else None)
     write_json(Path(a.out) / "report.json", report)
     print(json.dumps({"objective": report["objective"], "clean": report["clean"], "coverage": report["coverage"]}, indent=2))
 

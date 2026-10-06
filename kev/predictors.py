@@ -9,6 +9,7 @@ import math
 import os
 import subprocess
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -80,21 +81,22 @@ class LocalPredictor:
 
 
 class RemotePredictor:
-    """Score any TypeSafe System One-compatible endpoint (POST <base_url>/v1/systemone) on frozen records. Probabilities are
+    """Score any TypeSafe System One-compatible endpoint (POST <base_url><path>, /v1/systemone by default; OpenRouter's Decisions
+    API is https://openrouter.ai + /api/alpha/decisions) on frozen records. Probabilities are
     taken from the response as returned (renormalised by validate_distribution like every other predictor). Records the
     server-reported model id so the manifest can pin what was scored. `concurrency` is how many requests kev.benchmark may
     keep in flight at once (each call is independent: one request, its own retries); 1 scores sequentially."""
 
-    def __init__(self, base_url, model="kev-latest", api_key="local", timeout=120, retries=3, concurrency=1):
+    def __init__(self, base_url, model="kev-latest", api_key="local", timeout=120, retries=3, concurrency=1, path="/v1/systemone"):
         if concurrency < 1:
             raise ValueError("concurrency must be >= 1")
         self.base_url, self.model, self.api_key, self.timeout, self.retries = base_url.rstrip("/"), model, api_key, timeout, retries
-        self.concurrency = concurrency
+        self.concurrency, self.path = concurrency, path
         self.served_model = None
 
     def __call__(self, record):
         payload = json.dumps({**api_request(record), "model": self.model}).encode()
-        req = urllib.request.Request(f"{self.base_url}/v1/systemone", data=payload, method="POST",
+        req = urllib.request.Request(f"{self.base_url}{self.path}", data=payload, method="POST",
                                     headers={"content-type": "application/json", "authorization": f"Bearer {self.api_key}"})
         last = None
         for attempt in range(self.retries):
@@ -104,8 +106,11 @@ class RemotePredictor:
                     body = json.loads(resp.read())
                 latency = 1000 * (time.perf_counter() - start)
                 break
-            except Exception as error:   # 5xx / timeouts: retry with backoff; anything persistent surfaces as a rejected record
-                last = error; time.sleep(2 ** attempt)
+            except Exception as error:   # 429 / 5xx / timeouts: retry with backoff; anything persistent surfaces as a rejected record
+                last = error
+                if isinstance(error, urllib.error.HTTPError) and 400 <= error.code < 500 and error.code != 429:   # a bad request, path or key: no retry
+                    raise RuntimeError(f"remote endpoint refused the request: {error}") from error
+                if attempt < self.retries - 1: time.sleep(2 ** attempt)
         else:
             raise RuntimeError(f"remote endpoint failed after {self.retries} attempts: {last}")
         self.served_model = body.get("model", self.served_model)
