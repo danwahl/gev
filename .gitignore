@@ -466,6 +466,7 @@ evals/gev/aisi-animal-v1/*.jsonl
 !evals/gev/aisi-animal-v1/labels.jsonl
 evals/gev/speciesismbench-v1/*.jsonl
 !evals/gev/speciesismbench-v1/controls.jsonl
+evals/gev/speciesismbench-paper-v1/development.jsonl
 evals/gev/tac-v1/*.jsonl
 evals/gev/tac-v2/*.jsonl
 evals/gev/tac-v3/*.jsonl
