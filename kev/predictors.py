@@ -126,7 +126,7 @@ class LocalPredictor:
     @torch.no_grad()
     def __call__(self, record):
         enc = self.model.encode(self.tok, materialize(record), max_state=self.context["max_state"], max_branch=self.context["max_branch"], strict=True)
-        if len(enc["ids"]) > self.context["max_packed"]:
+        if enc["packed_tokens"] > self.context["max_packed"]:
             raise ContextOverflow(f"packed request exceeds the {self.context['max_packed']}-token limit")
         sync(self.device)
         start = time.perf_counter()

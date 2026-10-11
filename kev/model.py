@@ -121,9 +121,10 @@ def user_tokens(tok, text):
 
 
 OPT_NONE, OPT_DECIDE = -1, -2   # values of enc["opt"]: instruction/state tokens, and the <decide> token
+LAYOUTS = ("state", "instruction")   # encode(): whether a question's instruction comes after the shared state or before its own copy
 
 
-def encode(tok, rec, max_state=MAX_STATE, max_branch=MAX_BRANCH, strict=False, option_isolation=False):
+def encode(tok, rec, max_state=MAX_STATE, max_branch=MAX_BRANCH, strict=False, option_isolation=False, layout="state"):
     """Pack one record: [<state> ...] then per-question [<q> instr <opt> o </opt>... <decide>].
 
     Returns ids, seg (0 = state, k = question k), pos (branch positions restart after state),
@@ -134,6 +135,12 @@ def encode(tok, rec, max_state=MAX_STATE, max_branch=MAX_BRANCH, strict=False, o
     option spans share the same position ids, and <decide> sits at one fixed position after the longest span. Then the
     per-option representations and <decide>'s attention over them are permutation-invariant by construction.
 
+    layout="instruction": the questions share only <state>, and each branch reads its instruction before the state,
+    [<state>] then per question [instr <q> state <opt> o </opt>... <decide>], so the state is read knowing the question,
+    at the cost of reading it once per question. Rows are as long in either layout, and so is packed_tokens (the record's
+    length packed state first, which the max_packed limits count), so both layouts admit the same records.
+    state_tokens_used is the state segment the model reads (<state> included), in either layout.
+
     Not strict, a state over max_state tokens is cut to its first max_state (state_truncated; state_tokens is the whole
     state's count, the <state> token included, as the limit counts it). Strict, it raises ContextOverflow.
     """
@@ -142,11 +149,14 @@ def encode(tok, rec, max_state=MAX_STATE, max_branch=MAX_BRANCH, strict=False, o
         raise ContextOverflow(f"state exceeds {max_state} tokens: {len(state_tokens) + 1}", state_tokens=len(state_tokens) + 1, max_state=max_state)
     names = delimiters(tok)
     S = [tok.convert_tokens_to_ids(names[0])] + state_tokens[: max_state - 1]
+    if layout not in LAYOUTS: raise ValueError(f"layout must be one of {LAYOUTS}: {layout!r}")
+    if layout != "state" and option_isolation: raise ValueError("option_isolation needs the state layout")
+    S, after = (S, []) if layout == "state" else (S[:1], S[1:])
     ids, seg, pos, opt = list(S), [0] * len(S), list(range(len(S))), [OPT_NONE] * len(S)
     q_id, o_id, c_id, d_id = (tok.convert_tokens_to_ids(t) for t in names[1:])
     decide_idx, opt_idx = [], []
     for k, q in enumerate(rec["questions"], start=1):
-        instr = [q_id] + user_tokens(tok, q["instr"])
+        instr = [q_id] + user_tokens(tok, q["instr"]) if layout == "state" else user_tokens(tok, q["instr"]) + [q_id] + after
         spans = [[o_id] + user_tokens(tok, o) + [c_id] for o in q["options"]]
         br = instr + [t for sp in spans for t in sp] + [d_id]
         if len(br) > max_branch - len(S):
@@ -164,7 +174,8 @@ def encode(tok, rec, max_state=MAX_STATE, max_branch=MAX_BRANCH, strict=False, o
         ids += br; seg += [k] * len(br); pos += br_pos; opt += br_opt
         decide_idx.append(base + len(br) - 1); opt_idx.append([base + e for e in ends])
     return {"ids": ids, "seg": seg, "pos": pos, "opt": opt, "option_isolation": option_isolation, "decide_idx": decide_idx, "opt_idx": opt_idx,
-            "labels": [q["label"] for q in rec["questions"]], "state_tokens": len(state_tokens) + 1, "state_truncated": len(state_tokens) + 1 > max_state}
+            "labels": [q["label"] for q in rec["questions"]], "state_tokens": len(state_tokens) + 1, "state_truncated": len(state_tokens) + 1 > max_state,
+            "state_tokens_used": len(S) + len(after), "packed_tokens": len(ids) - len(after) * max(len(rec["questions"]) - 1, 0)}
 
 
 def admit(model, tok, rec, truncate=False):
@@ -186,7 +197,7 @@ def fits(rec, *tokenizers, max_state=MAX_STATE, max_branch=MAX_BRANCH, max_packe
     """True when the internal record encodes strictly (no truncation) within the training context under every tokenizer
     given (frozen suites are admitted against the tokenizers of all their pinned bases)."""
     try:
-        return all(len(encode(tok, rec, max_state=max_state, max_branch=max_branch, strict=True)["ids"]) <= max_packed for tok in tokenizers)
+        return all(encode(tok, rec, max_state=max_state, max_branch=max_branch, strict=True)["packed_tokens"] <= max_packed for tok in tokenizers)
     except ValueError:
         return False
 
@@ -281,7 +292,7 @@ def probs_one(model, enc, prefix, keep):
 
 
 class DecisionModel(nn.Module):
-    def __init__(self, name, tok, device, lora=None, revision=None, attn=None, head_dim=256, option_isolation=False, special_embeddings=False, lora_targets="all", dtype=torch.float32,
+    def __init__(self, name, tok, device, lora=None, revision=None, attn=None, head_dim=256, option_isolation=False, layout="state", special_embeddings=False, lora_targets="all", dtype=torch.float32,
                  weights=None, direct_load=False):
         """weights: a full-weight checkpoint directory whose saved backbone replaces the base's (kev.checkpoint's loader rule).
         direct_load: load the backbone straight onto `device` (transformers device_map) instead of staging it in host memory;
@@ -301,7 +312,7 @@ class DecisionModel(nn.Module):
         # packed form; the two agree to fp32 noise (tests/test_model.py::test_rows_match_packed).
         self.hybrid = is_hybrid(self.lm.config)
         if self.hybrid and option_isolation: raise ValueError("option_isolation needs the packed mask; not available on hybrid backbones")
-        self.option_isolation = option_isolation
+        self.option_isolation, self.layout = option_isolation, layout
         if lora:
             from peft import LoraConfig, get_peft_model
             extra = {"trainable_token_indices": {"embed_tokens": [tok.convert_tokens_to_ids(t) for t in delimiters(tok)]}} if special_embeddings else {}
@@ -332,8 +343,8 @@ class DecisionModel(nn.Module):
         return str(next(self.lm.parameters()).dtype).removeprefix("torch.")
 
     def encode(self, tok, rec, **kw):
-        """encode() with this model's option-isolation setting; use this from serving/eval code."""
-        return encode(tok, rec, option_isolation=self.option_isolation, **kw)
+        """encode() with this model's option-isolation and layout settings; use this from serving/eval code."""
+        return encode(tok, rec, option_isolation=self.option_isolation, layout=self.layout, **kw)
 
     def hidden(self, enc):
         return self.hidden_batch([enc])[0, : len(enc["ids"])]
@@ -368,9 +379,10 @@ class DecisionModel(nn.Module):
 
     def rows_form(self, encs):
         """Whether these records run as causal rows: hybrid backbones always (the recurrent layers cannot honour the packed
-        mask), attention-only ones when the packed sequence would exceed ROW_PASS_TOKENS (its L x L mask grows without
-        bound with the number of questions). The two forms agree (tests/test_model.py::test_rows_match_packed)."""
-        return self.hybrid or any(len(e["ids"]) > ROW_PASS_TOKENS for e in encs)
+        mask), the instruction layout always (its questions share only <state>, so packing saves nothing), attention-only
+        ones when the packed sequence would exceed ROW_PASS_TOKENS (its L x L mask grows without bound with the number of questions).
+        The two forms agree (tests/test_model.py::test_rows_match_packed)."""
+        return self.hybrid or self.layout != "state" or any(len(e["ids"]) > ROW_PASS_TOKENS for e in encs)
 
     def _rows_hidden(self, rows, cache=None, prefix_len=0):
         """Hidden states of causal token rows, one [L_i, d] tensor per row. In eval mode the rows go through the backbone

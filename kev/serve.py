@@ -186,7 +186,7 @@ class Server:
         sync(self.device); dt = round((time.time() - t) * 1000, 1)
         self.prefix_cache.store(keys, cached, prefixes)
         self.batches += 1; self.batched_requests += len(encs)
-        return [([q.tolist() for q in p], {"tokens": len(enc["ids"]), "state_tokens": enc["state_tokens"], "state_tokens_used": enc["seg"].count(0),
+        return [([q.tolist() for q in p], {"tokens": len(enc["ids"]), "state_tokens": enc["state_tokens"], "state_tokens_used": enc["state_tokens_used"],
                                            "latency_ms": dt, "prefix_cache_hit": c is not None})   # state_tokens: the request's state; _used: what the model read (less only when truncated)
                 for enc, p, c in zip(encs, ps, cached)]
 

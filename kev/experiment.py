@@ -31,7 +31,7 @@ from kev.checkpoint import LoadOptions
 from kev.device import DEVICE_HELP, DEVICES, empty_cache, select
 from kev.full_ft import snapshot_fractions, too_many_snapshots
 from kev.metrics import fit_temperature, paired_bootstrap
-from kev.model import MAX_STATE, MAX_TRAIN_STATE
+from kev.model import LAYOUTS, MAX_STATE, MAX_TRAIN_STATE
 from kev.predictors import LocalPredictor
 from kev.suite import CONTEXT, ENCODING, digest, load_split, read_json, read_manifest, record_digest, validate_training, write_json
 
@@ -45,8 +45,9 @@ RANGES = {"epochs": (1, 5), "seed": (0, 10000), "lr": (1e-6, 0.001), "lora": (1,
           "label_smoothing": (0, 0.2), "brier_w": (0, 2), "focal_gamma": (0, 4),
           "p_none": (0, 0.4), "p_none_distract": (0, 0.4), "p_distract": (0, 0.4), "p_none_pair": (0, 1), "synthetic_repeat": (1, 6), "public_frac": (0.05, 1.0), "head_lr": (0, 0.01), "weight_decay": (0, 0.3), "anchor_w": (0, 5)}
 CHOICES = {"dtype": ("fp32", "bf16"), "checkpointing": (0, 1), "option_isolation": (0, 1), "special_embeddings": (0, 1), "head_dim": (128, 256, 512, 1024),
-           "lora_targets": ("all", "dense", "attn", "qv"), "weights_dtype": ("fp32", "bf16"), "full_ft": (0, 1), "length_sort": (0, 1), "shared_prefix": (0, 1)}
-CHOICE_DEFAULTS = {"dtype": "fp32", "checkpointing": 0, "option_isolation": 0, "special_embeddings": 0, "head_dim": 256, "lora_targets": "all", "weights_dtype": "fp32", "full_ft": 0, "length_sort": 0, "shared_prefix": None}   # kev.train's defaults for the categorical knobs (shared_prefix: on with full_ft)
+           "lora_targets": ("all", "dense", "attn", "qv"), "weights_dtype": ("fp32", "bf16"), "full_ft": (0, 1), "length_sort": (0, 1), "shared_prefix": (0, 1),
+           "layout": LAYOUTS}
+CHOICE_DEFAULTS = {"dtype": "fp32", "checkpointing": 0, "option_isolation": 0, "special_embeddings": 0, "head_dim": 256, "lora_targets": "all", "weights_dtype": "fp32", "full_ft": 0, "length_sort": 0, "shared_prefix": None, "layout": "state"}   # kev.train's defaults for the categorical knobs (shared_prefix: on with full_ft)
 # optional integer knobs, passed to kev.train only when a trial sets them (so existing plans keep their config hashes)
 OPTIONAL_INTS = {"max_state": (MAX_STATE, MAX_TRAIN_STATE), "row_budget": (0, 65536), "max_steps": (0, 100000), "save_every_steps": (0, 100000),
                  "snapshot_every_steps": (0, 100000), "none_pair_max_state": (1, MAX_TRAIN_STATE), "pass_tokens_max": (1, 1 << 20)}

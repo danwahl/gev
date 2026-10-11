@@ -10,7 +10,7 @@ import pytest
 import torch
 from transformers.cache_utils import Cache, DynamicLayer, LinearAttentionLayer
 from kev.api import SystemOneRequest, choice_confidence, render, score_confidence, to_answers, to_record
-from kev.model import DecisionModel, SPECIAL, branch_mask, encode, user_tokens
+from kev.model import DecisionModel, SPECIAL, branch_mask, encode, rows_of, user_tokens
 
 
 def test_render_flattens_structured_content():
@@ -123,6 +123,26 @@ def test_encode_positions_restart_per_branch(tok):
     assert all(enc["pos"][i] == S for i in starts)
     assert enc["labels"] == [0, 1] and [len(o) for o in enc["opt_idx"]] == [2, 3]
     assert all(enc["ids"][d] == tok.convert_tokens_to_ids(SPECIAL[4]) for d in enc["decide_idx"])
+
+
+def test_instruction_layout_reads_the_question_before_the_state(tok):
+    rec = {"state": "s t a t e", "questions": [{"instr": "q1", "options": ["a", "b"], "label": 0}, {"instr": "q2", "options": ["a", "b", "c"], "label": 1}]}
+    default, other = encode(tok, rec), encode(tok, rec, layout="instruction")
+    S, _, rows = rows_of(other)
+    state, q, opt, decide = (tok.convert_tokens_to_ids(SPECIAL[i]) for i in (0, 1, 3, 4))
+    assert S == [state]
+    for row, d_row, instr in zip(rows, rows_of(default)[2], ("q1", "q2")):
+        ids, at = row["ids"], row["ids"].index(q)
+        assert ids[:at] == user_tokens(tok, instr) and ids[-1] == decide
+        assert ids[at + 1:at + 1 + len(user_tokens(tok, rec["state"]))] == user_tokens(tok, rec["state"]) and min(row["opts"]) > at
+        assert len(ids) + len(S) == len(d_row["ids"]) + default["seg"].count(0)
+        assert [ids[o] for o in row["opts"]] == [opt] * len(row["opts"])
+    assert other["labels"] == default["labels"] and [len(o) for o in other["opt_idx"]] == [2, 3]
+    # the length limits count the record packed state first, and the state the model reads, in either layout
+    assert other["packed_tokens"] == default["packed_tokens"] == len(default["ids"]) < len(other["ids"])
+    assert other["state_tokens_used"] == default["state_tokens_used"] == default["seg"].count(0) == 1 + len(user_tokens(tok, rec["state"]))
+    with pytest.raises(ValueError):
+        encode(tok, rec, layout="instruction", option_isolation=True)
 
 
 def test_load_records_jsonl(tmp_path):
@@ -322,7 +342,7 @@ def test_out_of_memory_drops_the_prefix_cache_and_retries_once():
             if self.fail == "other": raise ValueError("not memory")
             return [[torch.tensor([0.5, 0.5])] for _ in encs], [("prefix", self.calls) if k else None for k in keep]
 
-    enc = lambda state: {"ids": list(state) + [9], "seg": [0] * len(state) + [1], "state_tokens": len(state)}
+    enc = lambda state: {"ids": list(state) + [9], "seg": [0] * len(state) + [1], "state_tokens": len(state), "state_tokens_used": len(state)}
     model = Model()
     s = Server(SimpleNamespace(release_date=lambda: "2026-01-01"), None, model, "cpu")
     try:
@@ -675,6 +695,28 @@ def test_full_weight_checkpoint_round_trip(tiny_base, tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="lora_scale"):                        # before importing mlx: the refusal, not an ImportError
         ck.load("cpu", LoadOptions(backend="mlx", lora_scale=0.5))
     assert ck.backend("mps", LoadOptions(backend="auto")) == ("mlx" if mlx_available() else "torch")   # full weights run on MLX too (tests/test_mlx.py)
+
+
+def test_instruction_layout_round_trips_and_serves_as_rows(tiny_base, tmp_path, monkeypatch):
+    """--layout instruction is recorded in head.pt and comes back into the loaded DecisionModel, which always runs the row
+    form; the serving path (the <state> token as the cached prefix, then each question's row from it) gives the rows'
+    probabilities; the MLX backend refuses the layout before importing mlx; a model and a checkpoint of different
+    layouts do not warm-start each other."""
+    from kev.checkpoint import Checkpoint, LoadOptions, read_meta
+    from kev.data import load_records, materialize
+    train_tiny(tiny_base, tmp_path / "run", "--layout", "instruction", "--max_steps", "2", monkeypatch=monkeypatch)
+    assert read_meta(tmp_path / "run").layout == "instruction"
+    ck = Checkpoint(tmp_path / "run")
+    tok, model = ck.load("cpu", LoadOptions(dtype=torch.float32))
+    rec = materialize(load_records(tiny_base / "data.jsonl")[3])
+    enc = model.encode(tok, rec)
+    assert model.layout == "instruction" and model.rows_form([enc]) and enc["seg"].count(0) == 1
+    rows = [torch.softmax(z, -1) for z in model.forward(enc)]
+    assert max(float((a - b).abs().max()) for a, b in zip(model.probs(enc), rows)) < 1e-5
+    with pytest.raises(ValueError, match="layout"):
+        ck.load("cpu", LoadOptions(backend="mlx"))
+    with pytest.raises(Exception, match="layout"):
+        train_tiny(tiny_base, tmp_path / "delta", "--init_from", str(tmp_path / "run"), "--max_steps", "1", monkeypatch=monkeypatch)
 
 
 def test_full_weight_dtype_must_match_config(tiny_base, tmp_path, monkeypatch):
@@ -1046,15 +1088,17 @@ def test_none_pair_max_state_pairs_only_short_states_and_the_plan_counts_them(ti
     assert sorted(r["_meta"]["id"] for p in paired for c, _, _ in p for r in c) == sorted(r["_meta"]["id"] for p in plain for c, _, _ in p for r in c)
 
 
-def test_plan_shapes_are_the_encoded_shapes(tiny_base):
+@pytest.mark.parametrize("layout", ["state", "instruction"])
+def test_plan_shapes_are_the_encoded_shapes(tiny_base, layout):
     """--pass_tokens_max plans on plan_shapes: per record, the (state, branches) token shapes of exactly the variants
-    encode_batch then encodes (augmented, none-pair siblings included), with or without the gate's pairs."""
+    encode_batch then encodes (augmented, none-pair siblings included), with or without the gate's pairs, in either layout
+    (in the instruction layout each branch carries the state)."""
     from types import SimpleNamespace
     from kev.data import load_records
     from kev.model import MAX_STATE, load_tokenizer
     from kev.train import encode_batch, none_pairs, plan_shapes, shape, state_token_counts
     tok = load_tokenizer(str(tiny_base / "base"))
-    model = DecisionModel(str(tiny_base / "base"), tok, "cpu")
+    model = DecisionModel(str(tiny_base / "base"), tok, "cpu", layout=layout)
     reqs = load_records(tiny_base / "data.jsonl")
     counts = state_token_counts(tok, reqs)
     a = SimpleNamespace(seed=0, p_none=0.3, p_none_distract=0.3, p_distract=0.3, p_none_pair=0.5, none_pair_max_state=12, perm_kl=0.0, perm_frac=0.0,
@@ -1333,7 +1377,7 @@ def test_local_predictor_long_rows_on_mlx_use_its_forward(monkeypatch):
     class MLXShaped:   # the scoring interface kev.mlx_model.MLXDecisionModel exposes, minus everything unused here
         backend, hybrid, head = "mlx", True, SimpleNamespace(temperature=1.0)
         def encode(self, tok, rec, **kw):
-            return {"ids": [1] * 30 + [2, 3, 4], "seg": [0] * 30 + [1, 1, 1], "pos": list(range(33)), "decide_idx": [32], "opt_idx": [[31]]}
+            return {"ids": [1] * 30 + [2, 3, 4], "seg": [0] * 30 + [1, 1, 1], "pos": list(range(33)), "decide_idx": [32], "opt_idx": [[31]], "packed_tokens": 33}
         def forward(self, enc):
             calls.append(len(enc["ids"])); return [torch.tensor([0.0])]
     predictor = object.__new__(P.LocalPredictor)

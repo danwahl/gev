@@ -21,7 +21,7 @@ from .checkpoint import Checkpoint, Meta, write_meta
 from .device import DEVICE_HELP, DEVICES, allocated_bytes, empty_cache, select, sync
 from .data import EVAL_ONLY, build, augment, load_records, materialize, none_pair, source_seed
 from .suite import SYNTHETIC_SOURCES, digest, load_split, read_json, read_manifest, validate_training, write_json
-from .model import MAX_STATE, MAX_TRAIN_STATE, DecisionModel, fits, load_tokenizer, rows_of, training_context, user_tokens
+from .model import LAYOUTS, MAX_STATE, MAX_TRAIN_STATE, DecisionModel, fits, load_tokenizer, rows_of, training_context, user_tokens
 
 
 # --- losses -----------------------------------------------------------------------------------------------------------
@@ -310,10 +310,12 @@ def plan_shapes(model, tok, a, reqs, epoch, pairs, state_tokens):
     branches are tokenized again every epoch (augmentation draws per epoch), a few minutes on the SFT corpus. Encoded
     under a one-token state, a branch is not checked against its real state's row limit here: one that fits a one-token
     state but not the real one still raises ContextOverflow in encode_batch, mid-epoch, as without this flag (frozen
-    suites are admitted with branch headroom, so it does not arise on them)."""
+    suites are admitted with branch headroom, so it does not arise on them). In the instruction layout every branch reads
+    the state and only <state> is shared, so each branch counts the state's other tokens and the state counts one."""
     c = training_context(a.max_state)
     branches = lambda v: [len(r["ids"]) for r in rows_of(model.encode(tok, {**materialize(v), "state": ""}, max_state=c["max_state"], max_branch=c["max_branch"]))[2]]
-    return {id(r): [(state_tokens[id(r)], branches(v)) for v in record_variants(r, a, epoch, pairs)[0]] for r in reqs}
+    shape = (lambda s, b: (s, b)) if model.layout == "state" else (lambda s, b: (1, [n + s - 1 for n in b]))
+    return {id(r): [shape(state_tokens[id(r)], branches(v)) for v in record_variants(r, a, epoch, pairs)[0]] for r in reqs}
 
 
 def encode_batch(model, tok, a, chunk, epoch, pairs=None):
@@ -326,7 +328,7 @@ def encode_batch(model, tok, a, chunk, epoch, pairs=None):
         for v in variants:
             rec = materialize(v)
             enc = model.encode(tok, rec, strict=True, **limits)
-            if len(enc["ids"]) > c["max_packed"]:
+            if enc["packed_tokens"] > c["max_packed"]:
                 raise ValueError(f"training request exceeds {c['max_packed']} packed tokens")
             parts = question_parts(enc, a.row_budget, a.shared_prefix)
             for part in parts:   # one part unless --row_budget splits a record whose rows do not fit one pass
@@ -393,6 +395,7 @@ def parse_args():
                                                                                         "(torch._grouped_mm wants bf16); LoRA and head stay fp32 (peft upcasts adapters). The checkpoint records it and is loaded the same way.")
     ap.add_argument("--checkpointing", type=int, choices=[0, 1], default=0)
     ap.add_argument("--option_isolation", type=int, choices=[0, 1], default=0, help="option spans are isolated sub-branches with shared positions (exact permutation invariance)")
+    ap.add_argument("--layout", choices=LAYOUTS, default="state", help="state: each question reads the shared state first; instruction: it reads its instruction, then the state (kev.model.encode)")
     ap.add_argument("--special_embeddings", type=int, choices=[0, 1], default=0, help="also train the embeddings of the 5 delimiter tokens")
     ap.add_argument("--head_dim", type=int, default=256, help="pointer head dimension")
     ap.add_argument("--lora_targets", choices=["all", "dense", "attn", "qv"], default="all", help="LoRA module set; fewer modules = less drift from the base; dense = all minus the DeltaNet projections on hybrid bases")
@@ -541,14 +544,14 @@ def main():
 
     tok = load_tokenizer(a.base, revision=revision)
     model = DecisionModel(a.base, tok, dev, lora=None if a.full_ft else a.lora, revision=revision, head_dim=a.head_dim, lora_targets=a.lora_targets,
-                          option_isolation=bool(a.option_isolation), special_embeddings=bool(a.special_embeddings),
+                          option_isolation=bool(a.option_isolation), layout=a.layout, special_embeddings=bool(a.special_embeddings),
                           dtype=torch.bfloat16 if a.weights_dtype == "bf16" else torch.float32, direct_load=bool(a.full_ft))
     if a.checkpointing:
         model.lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.lm.config.use_cache = False
     # what this run will save as head.pt; also the architecture a warm start must match
     meta = Meta(base=a.base, base_revision=revision, lora=0 if a.full_ft else a.lora, head_dim=a.head_dim, option_isolation=bool(a.option_isolation),
-                special_embeddings=bool(a.special_embeddings), weights_dtype=a.weights_dtype, holdout=holdout, weights="full" if a.full_ft else "lora")
+                layout=a.layout, special_embeddings=bool(a.special_embeddings), weights_dtype=a.weights_dtype, holdout=holdout, weights="full" if a.full_ft else "lora")
     init_source = None
     if a.init_from:
         # delta mode (PR #9, Radexito): start from an already trained adapter (or full backbone) + pointer head instead of the

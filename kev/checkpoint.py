@@ -56,6 +56,7 @@ class Meta:
     lora: int = 0
     head_dim: int = 256
     option_isolation: bool = False
+    layout: str = "state"          # kev.model.LAYOUTS: "state" (shared state, then each question) or "instruction"
     special_embeddings: bool = False
     weights_dtype: str = "fp32"
     temperature: float = 1.0
@@ -63,7 +64,7 @@ class Meta:
     weights: str = "lora"          # "lora": an adapter on the base; "full": the whole backbone is in the checkpoint (kev.train --full_ft)
     extra: dict = field(default_factory=dict)
 
-    KNOWN = ("base", "head", "base_revision", "lora", "head_dim", "option_isolation", "special_embeddings", "weights_dtype", "temperature", "holdout", "weights")
+    KNOWN = ("base", "head", "base_revision", "lora", "head_dim", "option_isolation", "layout", "special_embeddings", "weights_dtype", "temperature", "holdout", "weights")
 
     @classmethod
     def from_dict(cls, d):
@@ -249,6 +250,7 @@ class Checkpoint:
         full = self.full
         if not full and not opts.merge: raise ValueError("the MLX backend always merges the adapter (KEV_MERGE=0 needs backend=torch)")
         if self.meta.option_isolation: raise ValueError("option_isolation needs the packed mask; not available on the MLX backend")
+        if self.meta.layout != "state": raise ValueError(f"layout {self.meta.layout!r} is not implemented on the MLX backend")
         if not self.hybrid_base(): raise ValueError(f"the MLX backend is for the hybrid (Qwen3.5) bases; {self.path if full else self.meta.base} is attention-only and runs on MPS with backend=torch")
         dtype = self.saved_dtype() if full else None
         from .mlx_model import MLXDecisionModel, load_base, load_full, merge_lora
@@ -288,7 +290,7 @@ class Checkpoint:
         values computed in fp32). Nothing to merge (`load` refuses lora_scale for full weights on either backend)."""
         meta = self.meta
         return DecisionModel(meta.base, tok, device, head_dim=meta.head_dim, option_isolation=meta.option_isolation,
-                             dtype=opts.dtype or getattr(torch, self.saved_dtype()), attn=opts.attn, weights=self.path), True
+                             layout=meta.layout, dtype=opts.dtype or getattr(torch, self.saved_dtype()), attn=opts.attn, weights=self.path), True
 
     def _adapted_torch(self, tok, device, opts):
         """-> (model, whether the adapter was merged): the base with this checkpoint's LoRA."""
@@ -302,7 +304,7 @@ class Checkpoint:
             dtype, merge = torch.bfloat16, merge and bool(opts.fused)
         merge = merge and not self.adapter_config().get("trainable_token_indices")   # token-trained adapters stay unmerged
         m = DecisionModel(meta.base, tok, device, lora=None, revision=meta.base_revision, head_dim=meta.head_dim,
-                          option_isolation=meta.option_isolation, dtype=dtype, attn=opts.attn)
+                          option_isolation=meta.option_isolation, layout=meta.layout, dtype=dtype, attn=opts.attn)
         m.lm = PeftModel.from_pretrained(m.lm, self.path, torch_device=str(device)).to(device)   # trainable token embeddings, if any, live in the adapter
         if opts.lora_scale != 1:
             for module in m.lm.modules():
@@ -313,7 +315,7 @@ class Checkpoint:
         if dtype != torch.float32: m.lm = m.lm.to(dtype)
         return m, merge
 
-    COMPAT_FIELDS = ("base", "base_revision", "lora", "head_dim", "option_isolation", "special_embeddings", "weights")
+    COMPAT_FIELDS = ("base", "base_revision", "lora", "head_dim", "option_isolation", "layout", "special_embeddings", "weights")
 
     def warm_start(self, model, ours):
         """Delta training: load this checkpoint's weights (adapter, or full backbone) and pointer head into `model` (a fresh
