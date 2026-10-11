@@ -9,6 +9,7 @@ import hashlib
 import json
 from pathlib import Path
 import random
+import re
 from datasets import load_dataset
 from .api import SystemOneRequest, to_record
 
@@ -22,7 +23,7 @@ def source_seed(seed, source):
 
 
 # Repos whose main branch is a (no longer supported) loading script; read the Hub's auto-converted parquet branch instead.
-PARQUET_BRANCH = {"CogComp/trec": "refs/convert/parquet"}
+PARQUET_BRANCH = {"CogComp/trec": "refs/convert/parquet", "hendrycks/ethics": "refs/convert/parquet"}
 
 
 def dataset_ref(repo):
@@ -40,10 +41,10 @@ class Source(random.Random):
         self.origins = []
 
 
-def _dataset(repo, split, src):
+def _dataset(repo, split, src, data_dir=None):
     """repo may be 'owner/name' or 'owner/name:config'; the Source carries the revision to pin."""
     name, _, config = repo.partition(":")
-    return load_dataset(name, config or None, split=split, revision=src.revision or PARQUET_BRANCH.get(name))
+    return load_dataset(name, config or None, split=split, revision=src.revision or PARQUET_BRANCH.get(name), data_dir=data_dir)
 
 NONE = "None of the above"
 # "None of the above" options must appear both as the correct answer and as a wrong alternative, with varied
@@ -82,6 +83,10 @@ def _desc(desc, rng, p_null=0.3, p_struct=0.1):
     return desc
 
 
+def _text_sha256(text):
+    return hashlib.sha256(" ".join(text.casefold().split()).encode()).hexdigest()
+
+
 def _sample(ds, n, src):
     rows = []
     src.origins = []
@@ -90,8 +95,7 @@ def _sample(ds, n, src):
         if row.get("label", 0) == -1:
             continue
         text = next((row[k] for k in ("text", "premise", "passage", "content", "question", "sentence") if isinstance(row.get(k), str)), json.dumps(row, sort_keys=True))
-        normalized = " ".join(text.casefold().split())
-        src.origins.append({"row": i, "text_sha256": hashlib.sha256(normalized.encode()).hexdigest(),
+        src.origins.append({"row": i, "text_sha256": _text_sha256(text),
                             "row_sha256": hashlib.sha256(json.dumps(row, sort_keys=True).encode()).hexdigest()})
         rows.append(row)
     return rows
@@ -244,15 +248,18 @@ def _sciq(split, n, rng):
     return out
 
 
-def _mcq(ex_q, labels, texts, answer_label, src, rng, state_extra=None):
-    """Knowledge MCQ -> Choice with neutral keys; option order shuffled per record so keys carry no information."""
+def _choice(instructions, labels, texts, answer_label, src, rng, state):
+    """Choice with neutral keys; option order shuffled per record so keys carry no information."""
     order = list(range(len(texts))); rng.shuffle(order)
     keys = [f"opt_{i + 1}" for i in range(len(texts))]
     crit = {keys[i]: texts[j] for i, j in enumerate(order)}
     label = keys[order.index(labels.index(answer_label))]
-    state = {"question": ex_q}
-    if state_extra: state.update(state_extra)
-    return {"state": state, "questions": {"answer": {"type": "choice", "instructions": "Which option correctly answers the question?", "criteria": crit, "label": label, "src": src}}}
+    return {"state": state, "questions": {"answer": {"type": "choice", "instructions": instructions, "criteria": crit, "label": label, "src": src}}}
+
+
+def _mcq(ex_q, labels, texts, answer_label, src, rng, state_extra=None):
+    """Knowledge MCQ -> Choice: the item's question is the state, answered by the option that answers it."""
+    return _choice("Which option correctly answers the question?", labels, texts, answer_label, src, rng, {"question": ex_q, **(state_extra or {})})
 
 
 def _arc(split, n, rng):
@@ -270,15 +277,79 @@ def _csqa(split, n, rng):
     return [_mcq(ex["question"], list(ex["choices"]["label"]), list(ex["choices"]["text"]), ex["answerKey"], "csqa", rng) for ex in _sample(ds, n, rng) if ex["answerKey"]]
 
 
+# a deontology scenario that states the speaker's role ("I am a parole officer ..."); every other one is a request
+ETHICS_ROLE = re.compile(r"(I|I'm|My|As)\b")
+ETHICS_SHORT = 400   # characters: every commonsense item ETHICS marks is_short is under it (the parquet copy drops the column)
+
+
+def _ethics(split, n, rng, repo="hendrycks/ethics"):
+    """ETHICS (Hendrycks et al. 2021): n // 5 records from each of its five subsets, worded as the paper's own prompts
+    (appendix) and labelled with the dataset's verdict:
+      commonsense (<= 400 chars) "<input>"                             Is this wrong?
+      justice, deontology roles  '"<scenario excuse>"'                 Would most people believe this reasonable to say?
+      deontology requests        'When asked "<request>": "<excuse>"'  the same question
+      virtue                     "<sentence>"                          Does the character in this sentence exhibit the trait "<trait>"?
+      utilitarianism             no state                              Which activity is more pleasant? (a Choice between the two quoted activities)
+    Virtue lists each sentence once per candidate trait, so it is drawn by sentence: one fitting and one non-fitting trait
+    from each of n // 10 sentences that have both in the split (a little over half of them). The paper ranks utilitarianism's
+    activities by a rating each; a Choice between the pair is the same comparison. repo is any dataset in ETHICS's layout
+    (one data_dir per subset, the parquet branch's splits), such as its animal subset (_ethics_animals), whose `ethics_row`
+    column each origin keeps beside its own row. An origin's text_sha256 is of the text its record shows (virtue's sentence with its trait)."""
+    out, origins = [], []
+    for subset in ("commonsense", "justice", "deontology", "virtue", "utilitarianism"):
+        ds = _dataset(repo, split=split, src=rng, data_dir=subset)
+        rows = list(range(len(ds)))
+        if subset == "commonsense": rows = [i for i, t in enumerate(ds["input"]) if len(t.strip()) <= ETHICS_SHORT]
+        if subset == "virtue":
+            traits = {}
+            for i, (scenario, label) in enumerate(zip(ds["scenario"], ds["label"])):
+                traits.setdefault(scenario.partition(" [SEP] ")[0].strip(), ([], []))[label].append(i)
+            pairs = [(rng.choice(fits), rng.choice(others)) for others, fits in traits.values() if fits and others]
+            rows = [i for pair in rng.sample(pairs, min(n // 10, len(pairs))) for i in pair]
+        shown = []
+        for ex in _sample(ds.select(rows), n // 5, rng):
+            if subset == "utilitarianism":
+                texts = [f'"{ex[k].strip()}"' for k in ("baseline", "less_pleasant")]
+                shown.append(" ".join(texts))
+                out.append(_choice("Which activity is more pleasant?", ["baseline", "less_pleasant"], texts, "baseline", "ethics_util", rng, ""))
+                continue
+            if subset == "commonsense":
+                state, question, src = ex["input"].strip(), "Is this wrong?", "ethics_cm"
+            elif subset == "virtue":
+                sentence, _, trait = ex["scenario"].partition(" [SEP] ")
+                state, question, src = sentence.strip(), f'Does the character in this sentence exhibit the trait "{trait.strip()}"?', "ethics_virtue"
+            else:
+                scenario, excuse = ex["scenario"].strip(), ex.get("excuse", "").strip()
+                state = (f'When asked "{scenario}": "{excuse}"' if subset == "deontology" and not ETHICS_ROLE.match(scenario)
+                         else f'"{f"{scenario} {excuse}".strip()}"')
+                question, src = "Would most people believe this reasonable to say?", f"ethics_{subset}"
+            q = {"type": "noul", "instructions": _instr(question, rng), "label": ex["label"] == 1, "src": src}
+            shown.append(f"{state} {trait.strip()}" if subset == "virtue" else state)
+            out.append({"state": _wrap_state(state, rng), "questions": {"answer": q}})
+        ethics_rows = ds["ethics_row"] if "ethics_row" in ds.column_names else None
+        origins += [{**o, "row": f"{subset}/{rows[o['row']]}", "text_sha256": _text_sha256(text), **({"ethics_row": f"{subset}/{ethics_rows[rows[o['row']]]}"} if ethics_rows else {})}
+                    for o, text in zip(rng.origins, shown, strict=True)]
+    rng.origins = origins
+    return out
+
+
+def _ethics_animals(split, n, rng):
+    """ETHICS-Animals: the ETHICS items in which an animal, or something made from or done with animals, is part of the
+    situation, drawn as _ethics draws ETHICS."""
+    return _ethics(split, n, rng, repo="drwahl/ethics-animals")
+
+
 ALL_SOURCES = {**SOURCES, "trec": (_trec, "train", "test"), "dbpedia14": (_dbpedia, "train", "test"), "emotion": (_emotion, "train", "test"),
                "imdb": (_imdb, "train", "test"), "amazon": (_amazon, "train", "test"), "qnli": (_qnli, "train", "validation"),
                "tweet_offensive": (_offensive, "train", "test"), "mmlu": (_mmlu, "test", "test"),
                "paws": (_paws, "train", "test"), "sciq": (_sciq, "train", "test"),
-               "arc": (_arc, "train", "test"), "openbookqa": (_openbookqa, "train", "test"), "csqa": (_csqa, "train", "validation")}
+               "arc": (_arc, "train", "test"), "openbookqa": (_openbookqa, "train", "test"), "csqa": (_csqa, "train", "validation"),
+               "ethics": (_ethics, "train", "test"), "ethics_animals": (_ethics_animals, "train", "test")}
 ALL_REPOS = {**REPOS, "trec": "CogComp/trec", "dbpedia14": "fancyzhx/dbpedia_14", "emotion": "dair-ai/emotion", "imdb": "stanfordnlp/imdb",
              "amazon": "SetFit/amazon_reviews_multi_en", "qnli": "nyu-mll/glue", "tweet_offensive": "cardiffnlp/tweet_eval", "mmlu": "cais/mmlu",
              "paws": "google-research-datasets/paws", "sciq": "allenai/sciq",
-             "arc": "allenai/ai2_arc", "openbookqa": "allenai/openbookqa", "csqa": "tau/commonsense_qa"}
+             "arc": "allenai/ai2_arc", "openbookqa": "allenai/openbookqa", "csqa": "tau/commonsense_qa", "ethics": "hendrycks/ethics",
+             "ethics_animals": "drwahl/ethics-animals"}
 
 # Policy (PLAN.md step 1). A source is trainable or eval-only; suites record both lists and training refuses eval-only
 # sources. MMLU is a knowledge probe and stays eval-only permanently; Emotion/TweetEval are noisy-label honesty checks;
@@ -286,7 +357,10 @@ ALL_REPOS = {**REPOS, "trec": "CogComp/trec", "dbpedia14": "fancyzhx/dbpedia_14"
 # Knowledge MCQ (ARC-Challenge, OpenBookQA, CommonsenseQA) is trainable: the hypothesis (PLAN.md, overnight) is that the
 # pointer readout under-uses the base model's knowledge (8B scores 0.65 on 4-way MMLU, below its base-model level) and
 # that a small MCQ mix teaches the head to tap it. MMLU and SciQ stay eval-only; ARC/SciQ are distinct datasets.
-TRAINABLE = ("banking77", "boolq", "agnews", "mnli", "sst5", "yelp", "trec", "dbpedia14", "amazon", "imdb", "arc", "openbookqa", "csqa")
+# ETHICS (Hendrycks et al. 2021) is trainable: five moral-judgement tasks in the paper's own prompts, whole or its animal subset
+# (ethics_animals, drwahl/ethics-animals); its test split (the paper's test_hard on the parquet branch) is the eval split.
+TRAINABLE = ("banking77", "boolq", "agnews", "mnli", "sst5", "yelp", "trec", "dbpedia14", "amazon", "imdb", "arc", "openbookqa", "csqa",
+             "ethics", "ethics_animals")
 EVAL_ONLY = ("mmlu", "emotion", "tweet_offensive", "qnli", "paws", "sciq")
 assert set(TRAINABLE) | set(EVAL_ONLY) == set(ALL_SOURCES) and not set(TRAINABLE) & set(EVAL_ONLY)
 

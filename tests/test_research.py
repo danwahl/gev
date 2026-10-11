@@ -86,6 +86,45 @@ def test_source_sampling_does_not_depend_on_other_sources(monkeypatch):
     assert alone[0] == next(r for r in together if r["_meta"]["source"] == "mnli")
 
 
+def test_ethics_pairs_virtue_traits_and_reads_its_animal_subset(monkeypatch):
+    """ETHICS: virtue is drawn by sentence (one fitting and one non-fitting trait each, only sentences with both),
+    utilitarianism is a stateless Choice, and ethics_animals draws the same way from the animal subset's repo."""
+    from datasets import Dataset
+    from kev import data
+    tables = {"commonsense": {"input": ["x" * 401 + " dog", "I fed the stray cat.", "I kicked the door."], "label": [1, 0, 1]},
+              "justice": {"scenario": ["I deserve a raise because my dog is cute.", "I deserve a raise because I work hard."], "label": [0, 1]},
+              "deontology": {"scenario": ["Can you walk the dog?", "I am a teacher."], "excuse": ["No, it is raining.", "So I grade papers."], "label": [1, 1]},
+              "virtue": {"scenario": ["She fed the horse. [SEP] kind", "She fed the horse. [SEP] cruel", "She fed the horse. [SEP] lazy",
+                                      "He sang. [SEP] cheerful", "He sang. [SEP] gloomy", "He waited. [SEP] rude"], "label": [1, 0, 0, 1, 0, 0]},
+              "utilitarianism": {"baseline": ["I walked my dog in the sun.", "I ate cake."], "less_pleasant": ["I walked my dog in the rain.", "I ate bread."]}}
+    repos = []
+    monkeypatch.setattr(data, "_dataset", lambda repo, split, src, data_dir=None: repos.append(repo) or Dataset.from_dict(tables[data_dir]))
+    def built(fn):
+        src = data.Source(0); recs = fn("train", 50, src)
+        return recs, [o["row"] for o in src.origins]
+    text = lambda s: s if isinstance(s, str) else s[0]["content"] if isinstance(s, list) else s.get("document") or s["ticket"]["body"]
+    recs, rows = built(data._ethics)
+    assert len(recs) == len(rows) == 2 + 2 + 2 + 4 + 2   # the long commonsense item is not short; the rows are the split's own
+    assert sorted(r for r in rows if r.startswith("commonsense/")) == ["commonsense/1", "commonsense/2"]
+    virtue = sorted((text(r["state"]), r["questions"]["answer"]["label"]) for r in recs if r["questions"]["answer"]["src"] == "ethics_virtue")
+    assert virtue == [("He sang.", False), ("He sang.", True), ("She fed the horse.", False), ("She fed the horse.", True)]
+    util = [r for r in recs if r["questions"]["answer"]["src"] == "ethics_util"]
+    assert all(r["state"] == "" and r["questions"]["answer"]["instructions"] == "Which activity is more pleasant?" for r in util)
+    assert {text(r["state"]) for r in recs if r["questions"]["answer"]["src"] == "ethics_deontology"} == {
+        'When asked "Can you walk the dog?": "No, it is raining."', '"I am a teacher. So I grade papers."'}
+    src = data.Source(0); recs = data._ethics("train", 50, src)   # the freeze deduplicates states by text_sha256
+    assert all(o["text_sha256"] == data._text_sha256(text(r["state"])) for r, o in zip(recs, src.origins)
+               if r["state"] and not o["row"].startswith("virtue/"))
+    assert len({o["text_sha256"] for o in src.origins}) == len(recs)   # a virtue sentence's two traits are two texts
+    assert set(repos) == {"hendrycks/ethics"}
+    repos.clear()
+    assert built(data._ethics_animals) == built(data._ethics) and set(repos) == {"drwahl/ethics-animals", "hendrycks/ethics"}
+    tables["justice"]["ethics_row"] = [7, 9]   # the animal subset's rows say where they sit in ETHICS
+    src = data.Source(0); data._ethics_animals("train", 50, src)
+    assert sorted((o["row"], o["ethics_row"]) for o in src.origins if o["row"].startswith("justice/")) == [("justice/0", "justice/7"), ("justice/1", "justice/9")]
+    assert data.ALL_REPOS["ethics_animals"] == "drwahl/ethics-animals"
+
+
 def test_strict_encoding_rejects_truncation():
     from types import SimpleNamespace
     from kev.model import SPECIAL, encode
