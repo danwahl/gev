@@ -56,7 +56,11 @@ Title Case sections, API tables, Authors + License); model cards are formal.
     torchrun from a host copy in a background thread, the interval stretched so blocking stays under 5 %), `--resume 1`
     continues bit for bit (same arguments and world size), `--stop_after N` exits after a step. LoRA runs resume too (the
     adapter and head are saved beside AdamW's moments); `--save_on_sigterm 1` writes a point after the current step on
-    SIGTERM and exits 143 (a preempted scheduler job), and `--resume 1` refuses a finished checkpoint. Snapshots:
+    SIGTERM and exits 143 (a preempted scheduler job), and `--resume 1` refuses a finished checkpoint. `--deterministic 1`
+    turns on PyTorch's deterministic kernels: on CUDA, flash and memory-efficient attention's backward otherwise sums in a
+    varying order, so two runs of the same arguments part by step 10. Measured on an attention-only base (Granite 4.1 8B
+    LoRA, RTX 4090: four 50-step runs bit-identical, 0.169 vs 0.168 s/record); Triton and causal-conv1d kernels (hybrid
+    bases) and NCCL's reductions are outside it, and long unmasked states may lose the flash kernel. Snapshots:
     `--snapshot_fractions 0.25,0.5,0.75` (of the optimizer steps) / `--snapshot_every_steps N` write loadable bf16 checkpoints
     into `<snapshot_dir>/step-<N>/checkpoint` (N zero-padded to 7 digits like resume points, `step-0000389`; `--snapshot_dir`,
     default `<out>-snapshots`; `kev.full_ft.SnapshotWriter`; at most `kev.budget.MAX_SNAPSHOTS` = 8 per run, the disk they

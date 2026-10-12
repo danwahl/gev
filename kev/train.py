@@ -441,6 +441,7 @@ def parse_args():
     ap.add_argument("--snapshot_every_steps", type=int, default=0, help="full-weight: also write a snapshot every N optimizer steps")
     ap.add_argument("--snapshot_dir", default="", help="where snapshots go (default <out>-snapshots; a study trial's are <trial>/snapshots)")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--deterministic", type=int, choices=[0, 1], default=0, help="PyTorch's deterministic kernels (torch.use_deterministic_algorithms; not Triton or causal-conv1d's)")
     a = ap.parse_args()
     if a.shared_prefix is None: a.shared_prefix = a.full_ft
     if min(a.epochs, a.accum, a.n_per_source, a.lora, a.batch, a.synthetic_repeat) < 1 or not 0 < a.public_frac <= 1:
@@ -542,6 +543,8 @@ def pinned_revision(a, manifest):
 
 def main():
     a = parse_args()
+    if a.deterministic:   # before the first cuBLAS call, which reads its workspace setting once
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8"); torch.use_deterministic_algorithms(True)
     # bf16 weights or autocast hit the accelerator in that dtype (the ROCm crash was the first bf16 kernel).
     dev = select(a.device, dtype=torch.bfloat16 if a.weights_dtype == "bf16" or a.dtype == "bf16" else torch.float32)
     rank, world = full_ft.init_distributed(dev) if a.full_ft else (0, 1)   # torchrun: each rank's "cuda" is its own GPU

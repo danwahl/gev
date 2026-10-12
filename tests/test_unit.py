@@ -1486,6 +1486,17 @@ def test_lora_resume_is_bit_identical(tiny_base, tmp_path):
     assert done.returncode != 0 and "is a finished checkpoint" in done.stderr
 
 
+def test_deterministic_kernels(tiny_base, tmp_path, monkeypatch):
+    """--deterministic 1 turns on PyTorch's deterministic kernels, and cuBLAS's fixed workspace, before the first of them runs."""
+    import os, torch
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ""); monkeypatch.delenv("CUBLAS_WORKSPACE_CONFIG")   # restored after the test either way
+    try:
+        train_tiny(tiny_base, tmp_path / "run", "--deterministic", "1", "--max_steps", "2", monkeypatch=monkeypatch)
+        assert torch.are_deterministic_algorithms_enabled() and os.environ["CUBLAS_WORKSPACE_CONFIG"] == ":4096:8"
+    finally:
+        torch.use_deterministic_algorithms(False)
+
+
 def test_sigterm_writes_a_resume_point(tiny_base, tmp_path):
     """--save_on_sigterm 1: a SIGTERM (a preempted poppler job, a cancelled one) during training finishes the current
     optimizer step, writes a resume point and exits 143; --resume 1 continues it to the same bits as an uninterrupted run."""
