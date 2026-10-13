@@ -657,3 +657,13 @@ runs/r18-9b/*-trial-*/transfer/*
 !runs/r11-docs/*-trial-*/provenance.json
 !runs/r16-9b/*-trial-*/provenance.json
 !runs/r18-9b/*-trial-*/provenance.json
+
+# Gev
+.env.local
+# rebuilt byte for byte by scripts/build_gev_speciesismbench.py and build_gev_aisi_{animal,harm}.py (the sources have no licence)
+evals/gev/speciesismbench-v1/*.jsonl
+!evals/gev/speciesismbench-v1/controls.jsonl
+evals/gev/aisi-animal-v1/*.jsonl
+!evals/gev/aisi-animal-v1/labels.jsonl
+evals/gev/aisi-harm-v1/*.jsonl
+!evals/gev/aisi-harm-v1/labels.jsonl

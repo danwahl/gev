@@ -1,0 +1,92 @@
+{
+  "version": 2,
+  "seed": 20260918,
+  "holdout_sources": [
+    "ethics"
+  ],
+  "eval_only": true,
+  "trainable_sources": [],
+  "eval_only_sources": [
+    "ethics"
+  ],
+  "policy": {
+    "trainable": [
+      "banking77",
+      "boolq",
+      "agnews",
+      "mnli",
+      "sst5",
+      "yelp",
+      "trec",
+      "dbpedia14",
+      "amazon",
+      "imdb",
+      "arc",
+      "openbookqa",
+      "csqa",
+      "ethics",
+      "ethics_animals"
+    ],
+    "eval_only": [
+      "mmlu",
+      "emotion",
+      "tweet_offensive",
+      "qnli",
+      "paws",
+      "sciq"
+    ]
+  },
+  "dataset_revisions": {
+    "hendrycks/ethics": "6deab74c03e30f13540266e373ce31f8466169f8"
+  },
+  "base_revisions": {
+    "Qwen/Qwen2.5-0.5B": "060db6499f32faf8b98477b0a26969ef7d8b9987",
+    "Qwen/Qwen3-0.6B-Base": "da87bfb608c14b7cf20ba1ce41287e8de496c0cd"
+  },
+  "context": {
+    "max_state": 384,
+    "max_branch": 1024,
+    "max_packed": 2048,
+    "truncate": false,
+    "admission_branch_headroom": 64
+  },
+  "selection": "Normalized exact-state deduplication across partitions; common tokenizer context admission; no fuzzy decontamination or pretraining-contamination claim.",
+  "legacy_checkpoints": "Training/calibration overlap for pre-manifest checkpoints is unknown; exploratory only.",
+  "objective": "Negative macro-average clean development NLL, equal weight per task; raw probabilities.",
+  "excluded_training_states_from": null,
+  "files": {
+    "train.jsonl": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "records": 0,
+      "questions": 0
+    },
+    "calibration.jsonl": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "records": 0,
+      "questions": 0
+    },
+    "development.jsonl": {
+      "sha256": "21586d1151bfc470c7407850055c609e2b4a7482d418165e5cba89619c9d5f2d",
+      "records": 1000,
+      "questions": 1000
+    },
+    "test.jsonl": {
+      "sha256": "5bb2c7d15663e486f28dd9dbc3a225087eadc1d8b1f4b03667dceea5190a0338",
+      "records": 1000,
+      "questions": 1000
+    }
+  },
+  "admission": {
+    "ethics": {
+      "considered": 2000,
+      "accepted": 2000
+    }
+  },
+  "excluded_training_state_hashes": 0,
+  "code_hashes": {
+    "data.py": "abf2b85e73ab38e09eaf1d5f095495285e3144b51b84444705b1b54b72a7ae42",
+    "api.py": "a6f53af5354f8ea17915abc78360fdf291a5108ce39a53a2d9135d48c603ae58",
+    "model.py": "c20a190ee5f1a736c75e5f1702134548fe65ac9f5a92c4607bf8d3dc79e400dd",
+    "suite.py": "8e7d257a10b4704d7bf4f8ec2c74dddf26aa5a2a610ea78610360e6baf43eff5"
+  }
+}
